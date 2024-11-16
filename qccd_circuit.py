@@ -192,95 +192,10 @@ class QCCDCircuit(stim.Circuit):
             clusterCentre = np.mean(p, axis=0)
             clusters.append((clusterIons, clusterCentre))
         return clusters
-    
-    def _partitionClusterClusters(
-        self, clusters: Sequence[Tuple[Sequence[Ion], npt.NDArray[np.float_]]], ancillaRatio: int
-    ) -> Sequence[Tuple[Sequence[Ion], npt.NDArray[np.float_]]]:
-        partitions = [list(c[1] for c in clusters)]
-        splitAxisIsX = True
-        while max([len(p) for p in partitions])>ancillaRatio:
-            toSplit = [p for p in partitions if len(p)>ancillaRatio]
-            for p in toSplit:
-                splitAxisVals = [float(c[int(splitAxisIsX)]) for c in p]
-                medAxisVal = np.mean(splitAxisVals)
-                p1 = []
-                p2 = []
-                for c, splAxisVal in zip(p, splitAxisVals):
-                    if splAxisVal <= medAxisVal:
-                        p1.append(c)
-                    else:
-                        p2.append(c)
-                if p1:
-                    partitions.append(p1)
-                if p2:
-                    partitions.append(p2)
-            splitAxisIsX = not splitAxisIsX
-            for p in toSplit:
-                partitions.remove(p)
-
-        clustersLeft = list(clusters)
-        clusters = []
-        for p in partitions:
-            clusterIons = []
-            clusterCentre = np.zeros_like(p[0])
-            for c in p:
-                cl = [cl for cl in clustersLeft if c[0]==cl[1][0] and c[1]==cl[1][1]][0]
-                cIons = cl[0]
-                clusterCentre += len(cIons)*c
-                clusterIons+=cIons
-                clustersLeft.remove(cl)
-            clusterCentre = (1/len(clusterIons))*clusterCentre
-            clusters.append((clusterIons, clusterCentre))
-        return clusters
 
     def _arrangeClusters(
         self,
         clusters: Sequence[Tuple[Sequence[Ion], Tuple[float, float]]],
-        rows: int,
-        cols: int,
-        n_iters: int = 5000,
-    ):
-        numClusters = len(clusters)
-        edges = np.array(
-            [[(i, j) for i in range(numClusters) if i != j] for j in range(numClusters)]
-        ).reshape(((numClusters - 1) * numClusters, 2))
-
-        # Only consider grid positions within a minimal region to avoid transport overheads
-        rs = min(rows, int(1 + numClusters / cols))
-        cs = cols
-        allGridPos = []
-        for c in range(cs):
-            allGridPos+=[(c, r) for r in range(rs)]
-        # Initial discrete grid positions
-        initialGridPos = allGridPos[:numClusters].copy()
-        freeGridPos = allGridPos[numClusters:].copy()
-
-        bestPos = initialGridPos.copy()
-        bestError = self._objectiveFunctionForArrangement(
-            np.array(initialGridPos), edges, clusters
-        )
-        newPos = initialGridPos
-        # FIXME: SEE BELOW FUNCTION Simple random walk optimisation algorithm, without hill climbing, perhaps reconsider
-        for _ in range(n_iters):
-            cluster = np.random.randint(numClusters)
-            gridPos = np.random.randint(cs), np.random.randint(rs)
-            oldGridPos = newPos[cluster]
-            if gridPos in freeGridPos:
-                freeGridPos[freeGridPos.index(gridPos)] = oldGridPos
-            else:
-                newPos[newPos.index(gridPos)] = oldGridPos
-            newPos[cluster] = gridPos
-            newError = self._objectiveFunctionForArrangement(np.array(newPos), edges, clusters)
-            if newError < bestError:
-                bestError = newError
-                bestPos = newPos
-        return bestPos
-
-    def _arrangeClustersAugmentedGrid(
-        self,
-        clusters: Sequence[Tuple[Sequence[Ion], Tuple[float, float]]],
-        rows: int,
-        cols: int,
         allGridPos: Sequence[Tuple[int, int]],
         compact: bool = False
     ):
@@ -513,21 +428,7 @@ class QCCDCircuit(stim.Circuit):
         return logicalError, meanPhysicalXError, meanPhysicalZError
 
                 
-
-    def processCircuitAugmentedGrid(
-        self,
-        trapCapacity: int = 2,
-        rows: int = 1,
-        cols: int = 5,
-        padding: int = 1,
-        dataQubitIdxs: Optional[Sequence[int]]=None
-        # capacityIsInTermsOfDataIons: bool = False
-    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
-        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
-        if trapCapacity * ((rows-1) * (2*cols-1)+cols) < len(self._ionMapping):
-            raise ValueError("processCircuit: not enough traps")
-           
-
+    def _regularPartition(self, trapCapacity: int):
         dIonsPerTrap = trapCapacity 
         while True:
             measurementIons = list(self._measurementIons)
@@ -549,11 +450,25 @@ class QCCDCircuit(stim.Circuit):
                     ions = list(self._measurementIons)+list(self._dataIons)
                     ionCoords = np.array([list(ion.pos) for ion in ions])
                     clusters=self._partitionClusterIons(ions, ionCoords, trapCapacity-1)
-                    break 
+                    return clusters 
                 dIonsPerTrap -= 1
             else:
-                break
+                return clusters
 
+    def processCircuitAugmentedGrid(
+        self,
+        trapCapacity: int = 2,
+        rows: int = 1,
+        cols: int = 5,
+        padding: int = 1,
+        dataQubitIdxs: Optional[Sequence[int]]=None
+        # capacityIsInTermsOfDataIons: bool = False
+    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
+        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+        if (trapCapacity-1) * ((rows-1) * (2*cols-1)+cols) < len(self._ionMapping):
+            raise ValueError("processCircuit: not enough traps")
+           
+        clusters=self._regularPartition(trapCapacity)
 
         cs, rs = cols, rows
         allGridPos = []
@@ -563,7 +478,7 @@ class QCCDCircuit(stim.Circuit):
                 if c < cs-1 and r<rs-1:
                     allGridPos.append((2*c+1, 2*r+1)) 
 
-        gridPositions = self._arrangeClustersAugmentedGrid(clusters, rows, cols, (trapCapacity>=2), allGridPos=allGridPos)
+        gridPositions = self._arrangeClusters(clusters, compact=(trapCapacity>=2), allGridPos=allGridPos)
         gridPositions = [(c+padding, r+padding) for (c, r) in gridPositions]
         rows = rows+2*padding
         cols = cols+2*padding
@@ -607,7 +522,6 @@ class QCCDCircuit(stim.Circuit):
                 )
                 self._originalArrangement[traps_dict[(2*col+1, 2*row+1)]] = ions
             
-        # TODO use honeycomb architecture aswell so split this class
         if rows == 1:
             for (col, r), trap_node in traps_dict.items():
                 if (col + 1, r) in traps_dict:
@@ -648,6 +562,74 @@ class QCCDCircuit(stim.Circuit):
                         self._arch.addEdge(
                             traps_dict[(2*col+1, 2*row+1)], junctions_dict[(2*col + 2, 2*row+1)]
                         )
+
+        return self._arch, (instructions, barriers)
+    
+
+    def processCircuitNetworkedGrid(self,
+        trapCapacity: int = 2,
+        traps: int = 1,
+        dataQubitIdxs: Optional[Sequence[int]]=None
+        # capacityIsInTermsOfDataIons: bool = False
+    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
+        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+        if (trapCapacity-1) * traps< len(self._ionMapping):
+            raise ValueError("processCircuit: not enough traps")
+           
+        clusters=self._regularPartition(trapCapacity)
+
+        allGridPos = []
+        for r in range(traps):
+            allGridPos.append((0, r))
+
+        gridPositions = self._arrangeClusters(clusters, allGridPos=allGridPos, compact=True)
+
+        trap_for_grid = {
+            row: clusters[trapIdx]
+            for trapIdx, (_, row) in enumerate(gridPositions)
+        }
+        self._originalArrangement = {}
+
+        self._arch = QCCDArch()
+        traps_dict = {}
+        for row in range(traps):
+            if row in trap_for_grid:
+                ions = trap_for_grid[row][0]
+            else:
+                ions = []
+            traps_dict[row] = self._arch.addManipulationTrap(
+                *self._gridToCoordinate((0, row), trapCapacity),
+                ions,
+                color=self.TRAP_COLOR,
+                isHorizontal=True,
+                capacity=trapCapacity
+            )
+            self._originalArrangement[traps_dict[row]] = ions
+
+
+        switch_cost = 1
+        junctions_dict = {}
+        
+        for row, trap_node in traps_dict.items():
+            for i in range(switch_cost):
+                junction2 = self._arch.addJunction(
+                    *self._gridToCoordinate((i+1, row), trapCapacity),
+                    color=self.JUNCTION_COLOR,
+                )
+                junctions_dict[(i+1, row)] = junction2
+                if i==0:
+                    self._arch.addEdge(trap_node, junction2)
+                else:
+                    self._arch.addEdge(junctions_dict[(i, row)], junction2)
+
+        for row, trap_node in traps_dict.items(): 
+            junction2 = junctions_dict[(switch_cost, row)]
+            for row2 in range(traps):
+                if row==row2:
+                    continue
+               
+                junction1 = junctions_dict[(switch_cost, row2)]
+                self._arch.addEdge(junction1, junction2)
 
         return self._arch, (instructions, barriers)
 
