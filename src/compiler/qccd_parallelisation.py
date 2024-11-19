@@ -1,29 +1,17 @@
 
 import numpy as np
-import numpy.typing as npt
 from typing import (
     Sequence,
     List,
     Tuple,
-    Optional,
     Mapping,
-    Callable,
-    Union,
-    Any,
     Set,
     Dict,
 )
-from matplotlib import pyplot as plt
-import networkx as nx
-import enum
-from matplotlib.patches import Ellipse
-import abc
-import stim
-from scipy.spatial import distance
-import pymatching
-from qccd_nodes import *
-from qccd_operations import *
-from qccd_operations_on_qubits import *
+from src.utils.qccd_nodes import *
+from src.utils.qccd_operations import *
+from src.utils.qccd_operations_on_qubits import *
+from collections import defaultdict, deque
 
 
 def paralleliseOperationsSimple(

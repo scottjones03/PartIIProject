@@ -1,25 +1,14 @@
 import numpy as np
-import numpy.typing as npt
 from typing import (
     Sequence,
     List,
     Tuple,
     Optional,
-    Mapping,
-    Callable,
-    Union,
-    Any,
-    Set,
-    Dict,
+    Union
 )
-from matplotlib import pyplot as plt
 import networkx as nx
 import enum
-from matplotlib.patches import Ellipse
 import abc
-import stim
-from scipy.spatial import distance
-import pymatching
 
 
 class Operations(enum.Enum):

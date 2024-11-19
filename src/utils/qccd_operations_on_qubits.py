@@ -1,4 +1,4 @@
-from qccd_operations import *
+from src.utils.qccd_operations import *
 
 
 

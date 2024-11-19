@@ -17,6 +17,7 @@ from src.utils.qccd_operations_on_qubits import *
 from src.utils.qccd_arch import *
 from src.compiler.qccd_parallelisation import *
 from src.compiler.qccd_qubits_to_ions import *
+from src.compiler.qccd_ion_routing import *
 import logging
 from multiprocessing import get_logger
 
@@ -330,7 +331,7 @@ class QCCDCircuit(stim.Circuit):
                 if c < cs-1 and r<rs-1:
                     allGridPos.append((2*c+1, 2*r+1)) 
 
-        gridPositions = arrangeClusters(clusters, compact=(trapCapacity>=2), allGridPos=allGridPos)
+        gridPositions = arrangeClusters(clusters, compact=(trapCapacity>2), allGridPos=allGridPos)
         gridPositions = [(c+padding, r+padding) for (c, r) in gridPositions]
         rows = rows+2*padding
         cols = cols+2*padding
@@ -512,41 +513,43 @@ def process_circuit(distance, capacity, gate_improvements, num_shots):
 
     results = {"ElapsedTime": {}, "Operations": {}, "MeanConcurrency": {}, "QubitOperations": {}, "LogicalErrorRates": {}, "PhysicalZErrorRates": {}, "PhysicalXErrorRates": {}}
 
-    for method_, label in zip([arch.processOperationsWithSafety, arch.processOperationsViaRouting][:1], ["Forwarding", "Routing"][:1]):
-        logger.info(f"Processing operations using {label} for distance {distance} and capacity {capacity}")
-        
-        allOps, barriers = method_(instructions, capacity)
-        parallelOpsMap = paralleliseOperationsWithBarriers(allOps, barriers)
-        logicalErrors = []
-        physicalZErrors = []
-        physicalXErrors = []
-        
-        for gate_improvement in gate_improvements:
-            logicalError, physicalXError, physicalZError = circuit.simulate(allOps, num_shots=num_shots, error_scaling=gate_improvement)
-            logicalErrors.append(logicalError)
-            physicalZErrors.append(physicalZError)
-            physicalXErrors.append(physicalXError)
+    # FIXME legacy formatting!
+    label ="Forwarding"
 
-        logger.info(f"Simulated {label} method with gate improvements for distance {distance}, capacity {capacity}")
-        
-        
-        for op in parallelOpsMap.values():
-            op.calculateOperationTime()
-            op.calculateFidelity()
+    logger.info(f"Processing operations using {label} for distance {distance} and capacity {capacity}")
+    
+    allOps, barriers = ionRouting(arch, instructions, capacity)
+    parallelOpsMap = paralleliseOperationsWithBarriers(allOps, barriers)
+    logicalErrors = []
+    physicalZErrors = []
+    physicalXErrors = []
+    
+    for gate_improvement in gate_improvements:
+        logicalError, physicalXError, physicalZError = circuit.simulate(allOps, num_shots=num_shots, error_scaling=gate_improvement)
+        logicalErrors.append(logicalError)
+        physicalZErrors.append(physicalZError)
+        physicalXErrors.append(physicalXError)
 
-        circuit.resetArch()
-        arch.refreshGraph()
+    logger.info(f"Simulated {label} method with gate improvements for distance {distance}, capacity {capacity}")
+    
+    
+    for op in parallelOpsMap.values():
+        op.calculateOperationTime()
+        op.calculateFidelity()
 
-        results["Capacity"] = capacity
-        results["Distance"] = distance
-        results["ElapsedTime"][label] = max(parallelOpsMap.keys())
-        results["Operations"][label] = len(allOps)
-        results["MeanConcurrency"][label] = np.mean([len(op.operations) for op in parallelOpsMap.values()])
-        results["QubitOperations"][label] = len(instructions)
-        results["LogicalErrorRates"][label] = logicalErrors
-        results["PhysicalZErrorRates"][label] = physicalZErrors
-        results["PhysicalXErrorRates"][label] = physicalXErrors
-        logger.info(f"{distance} {capacity} {label} = {results}")
+    circuit.resetArch()
+    arch.refreshGraph()
+
+    results["Capacity"] = capacity
+    results["Distance"] = distance
+    results["ElapsedTime"][label] = max(parallelOpsMap.keys())
+    results["Operations"][label] = len(allOps)
+    results["MeanConcurrency"][label] = np.mean([len(op.operations) for op in parallelOpsMap.values()])
+    results["QubitOperations"][label] = len(instructions)
+    results["LogicalErrorRates"][label] = logicalErrors
+    results["PhysicalZErrorRates"][label] = physicalZErrors
+    results["PhysicalXErrorRates"][label] = physicalXErrors
+    logger.info(f"{distance} {capacity} {label} = {results}")
     
     logger.info(f"Finished processing for distance {distance} and capacity {capacity}")
     return results

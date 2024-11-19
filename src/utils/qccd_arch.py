@@ -5,7 +5,6 @@ from typing import (
     Tuple,
     Optional,
     Mapping,
-    Set,
     Dict,
 )
 from matplotlib import pyplot as plt
