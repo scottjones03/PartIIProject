@@ -1,4 +1,4 @@
-PYTHON = python3
+PYTHON = python3.11
 VENV = venv
 REQ = requirements.txt
 CONFIG = config.yaml
