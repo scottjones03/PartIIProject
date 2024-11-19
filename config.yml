@@ -1,0 +1,16 @@
+# QCCD Hardware Parameters
+hardware:
+  trap_capacity: [2,3,4,5,6,7,8,9,10,11,12,13,14,15,30,60,120]  
+  topology: "grid" 
+
+# QEC Code Properties
+qec:
+  code_type: "surface_code:rotated_memory_z"
+  distances: [3, 5, 7, 9]  
+  gate_improvements: [1.0, 5.0, 10.0]
+
+# Simulation Settings
+simulation:
+  rounds: 1  # Number of rounds for error correction
+  num_shots: 1000000  # Number of shots for Monte Carlo simulations
+  log_file: process_log.txt  
