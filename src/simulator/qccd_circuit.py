@@ -331,7 +331,7 @@ class QCCDCircuit(stim.Circuit):
                 if c < cs-1 and r<rs-1:
                     allGridPos.append((2*c+1, 2*r+1)) 
 
-        gridPositions = arrangeClusters(clusters, compact=(trapCapacity>2), allGridPos=allGridPos)
+        gridPositions = arrangeClusters(clusters, allGridPos=allGridPos)
         gridPositions = [(c+padding, r+padding) for (c, r) in gridPositions]
         rows = rows+2*padding
         cols = cols+2*padding
@@ -377,8 +377,8 @@ class QCCDCircuit(stim.Circuit):
             
         if rows == 1:
             for (col, r), trap_node in traps_dict.items():
-                if (col + 1, r) in traps_dict:
-                    self._arch.addEdge(trap_node, traps_dict[(col + 1, r)])
+                if (col + 2, r) in traps_dict:
+                    self._arch.addEdge(trap_node, traps_dict[(col + 2, r)])
         else:
             junctions_dict = {}
             for (col, row), trap_node in traps_dict.items():
@@ -435,7 +435,7 @@ class QCCDCircuit(stim.Circuit):
         for r in range(traps):
             allGridPos.append((0, r))
 
-        gridPositions = arrangeClusters(clusters, allGridPos=allGridPos, compact=True)
+        gridPositions = arrangeClusters(clusters, allGridPos=allGridPos)
 
         trap_for_grid = {
             row: clusters[trapIdx]
@@ -507,8 +507,8 @@ def process_circuit(distance, capacity, gate_improvements, num_shots):
 
     logger.info(f"Processing circuit with {nqubitsNeeded} qubits and {nrowsNeeded} rows")
 
-    arch, (instructions, _) = circuit.processCircuitAugmentedGrid(rows=nrowsNeeded, cols=nrowsNeeded, trapCapacity=capacity)
-    # arch, (instructions, _) = circuit.processCircuitNetworkedGrid(traps=nqubitsNeeded, trapCapacity=capacity)
+    # arch, (instructions, _) = circuit.processCircuitAugmentedGrid(rows=nrowsNeeded, cols=nrowsNeeded, trapCapacity=capacity)
+    arch, (instructions, _) = circuit.processCircuitNetworkedGrid(traps=nqubitsNeeded, trapCapacity=capacity)
     arch.refreshGraph()
 
     results = {"ElapsedTime": {}, "Operations": {}, "MeanConcurrency": {}, "QubitOperations": {}, "LogicalErrorRates": {}, "PhysicalZErrorRates": {}, "PhysicalXErrorRates": {}}

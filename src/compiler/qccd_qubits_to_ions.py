@@ -6,6 +6,7 @@ from typing import (
     Sequence,
     Tuple,
 )
+import itertools
 from src.utils.qccd_nodes import *
 from src.utils.qccd_operations import *
 from src.utils.qccd_operations_on_qubits import *
@@ -75,73 +76,97 @@ def regularPartition(measurementIons: Sequence[Ion], dataIons: Sequence[Ion], tr
 
 def arrangeClusters(
     clusters: Sequence[Tuple[Sequence[Ion], Tuple[float, float]]],
-    allGridPos: Sequence[Tuple[int, int]],
-    compact: bool = False
+    allGridPos: Sequence[Tuple[int, int]]
 ):
-    A, B = np.array([c[1] for c in clusters]), np.array(allGridPos)
-    
-    # Function to iteratively compact points by shifting them towards the centroid
-    def iterative_compacting(B, mapped_indices):
-        mapped_points = B[mapped_indices]
-        unused_indices = np.setdiff1d(np.arange(len(B)), mapped_indices)
-        unused_points = B[unused_indices]
-        
-        for cutoff in (np.sqrt(2),2):
-            # Compute the centroid of the current mapped points in B
-            centroid = np.mean(mapped_points, axis=0)
-            # Repeat the compacting process until no more points can move closer
-            moved = True
-            while moved:
-                moved = False
-                
-                # Compute distances from the centroid for mapped points
-                distances_from_centroid = np.linalg.norm(mapped_points - centroid, axis=1)
-                
-                # Sort mapped points by their distance to the centroid (closest first)
-                sorted_indices = np.argsort(-distances_from_centroid)
-                
-                for i in sorted_indices:
-                    current_point = mapped_points[i]
-                    unused_points_to_consider = unused_points[np.linalg.norm(unused_points - centroid, axis=1) < np.linalg.norm(current_point - centroid)]
-                    distances_to_unused_to_consider = np.linalg.norm(unused_points_to_consider - current_point, axis=1)
-                    unused_points_to_consider = unused_points_to_consider[distances_to_unused_to_consider<=cutoff]
-                    distances_to_unused_to_consider = distances_to_unused_to_consider[distances_to_unused_to_consider<=cutoff]
-                    if len(distances_to_unused_to_consider) == 0:
-                        continue
-                    
-                    # Find the nearest unused point to the current point
-                    nearest_unused_idx_to_consider = np.argmin(distances_to_unused_to_consider)
-                    nearest_unused_point = unused_points_to_consider[nearest_unused_idx_to_consider]
-                
-                    # Move the current point to the nearest unused point
-                    # Update mapped_indices to reflect this reassignment
-                    original_index = np.where(np.all(B == current_point, axis=1))[0][0]
-                    new_index_inB = np.where(np.all(B == nearest_unused_point, axis=1))[0][0]
-                    new_index_in_unused_points = np.where(np.all(unused_points == nearest_unused_point, axis=1))[0][0]
-                    mapped_indices[i] = new_index_inB
-                    mapped_points[i] = nearest_unused_point
-                        
-                    # Update unused_points and unused_indices
-                    unused_points = np.delete(unused_points, new_index_in_unused_points, axis=0)
-                    unused_indices = np.setdiff1d(unused_indices, [new_index_inB])
-                    unused_points = np.vstack([unused_points, [B[original_index]]])
-                    unused_indices = np.append(unused_indices, original_index)
-                        
-                    moved = True 
-            
-        # Return the compacted mapped indices
-        return mapped_indices
+    A = np.array([c[1] for c in clusters])
+    minX, minY = min([w[0] for w in A]), min([w[1] for w in A])
+    maxX, maxY = max([w[0] for w in A]), max([w[1] for w in A])
+    dX, dY = maxX-minX, maxY-minY
+    if dX==0:
+        dX = 1
+    if dY==0:
+        dY = 1
+    centralizerMatrix = np.array([(minX, minY) for _ in range(A.shape[0])])
+    dividerMatrix = np.array([(dX, dY) for _ in range(A.shape[0])])
+    A = np.divide((A-centralizerMatrix), dividerMatrix)
+    if len(allGridPos)==0 or len(A)==0:
+        return []
+    centroidB = np.mean(allGridPos, axis=0)
+    sortedToCentroidB = sorted(allGridPos, key=lambda p: (p[0]-centroidB[0])**2+(p[1]-centroidB[1])**2)
+    aroundCentroid = []
+    for xsign, ysign in [(-1,0), (1,0),(0,1),(0,-1), (0,0),(1,1), (-1,-1), (1,-1),(-1,1)]:
+        for p in sortedToCentroidB:
+            if xsign == -1 and p[0]<centroidB[0]:
+                if ysign == -1 and p[1]<centroidB[1]:
+                    aroundCentroid.append(p)
+                    break
+                elif ysign == 1 and p[1]>centroidB[1]:
+                    aroundCentroid.append(p)
+                    break
+                elif ysign==0:
+                    aroundCentroid.append(p)
+                    break
+            elif xsign == 1 and p[0]>centroidB[0]:
+                if ysign == -1 and p[1]<centroidB[1]:
+                    aroundCentroid.append(p)
+                    break
+                elif ysign == 1 and p[1]>centroidB[1]:
+                    aroundCentroid.append(p)
+                    break
+                elif ysign==0:
+                    aroundCentroid.append(p)
+                    break
+            elif xsign==0:
+                if ysign == -1 and p[1]<centroidB[1]:
+                    aroundCentroid.append(p)
+                    break
+                elif ysign == 1 and p[1]>centroidB[1]:
+                    aroundCentroid.append(p)
+                    break
 
-    # Function to map points from A to B using global and compactness constraints
-    def map_A_to_B_with_compactness(A, B):
-        cost_matrix = distance_matrix(A, B)
-        # the Hungarian algorithm to find the initial injective mapping
-        _, col_ind = linear_sum_assignment(cost_matrix)
-        return col_ind
+                elif ysign==0:
+                    aroundCentroid.append(p)
+                    break
+    bestcost = np.inf
+    bestmap = []
+    aroundCentroid = set(aroundCentroid)
+    for centroidB in aroundCentroid:
+        notPickedYet: Dict[float, List[Tuple[int, int]]] = {}
+        for p in allGridPos:
+            dis = max((p[0]-centroidB[0])**2,(p[1]-centroidB[1])**2)
+            if dis not in notPickedYet:
+                notPickedYet[dis]=[p]
+            else:
+                notPickedYet[dis].append(p)
+        cardinalityA = len(A)
+        if cardinalityA > len(allGridPos):
+            raise ValueError("Not enough traps")
+        gauranteedInBSubset = []
+        nextWindow = []
+        while True:
+            nextWindow = notPickedYet.pop(min(notPickedYet.keys()))
+            if len(gauranteedInBSubset)+len(nextWindow)<cardinalityA:
+                gauranteedInBSubset.extend(nextWindow)
+            else:
+                break
 
-    # Mapping points from A to B with a combination of global structure preservation and compactness
-    mapping = map_A_to_B_with_compactness(A, B)
-    if compact:
-        mapping =iterative_compacting(B, mapping)
-
-    return [allGridPos[idx] for idx in mapping]
+        minX, minY = min([w[0] for w in nextWindow]), min([w[1] for w in nextWindow])
+        maxX, maxY = max([w[0] for w in nextWindow]), max([w[1] for w in nextWindow])
+        dX, dY = maxX-minX, maxY-minY
+        if dX==0:
+            dX = 1
+        if dY==0:
+            dY = 1
+        centralizerMatrix = np.array([(minX, minY) for _ in range(cardinalityA)])
+        dividerMatrix = np.array([(dX, dY) for _ in range(cardinalityA)])
+        for notGauranteedInBSubset in itertools.combinations(nextWindow, cardinalityA-len(gauranteedInBSubset)):
+            BSubset = np.array(list(notGauranteedInBSubset)+gauranteedInBSubset)
+            RelBSubset = np.divide((BSubset-centralizerMatrix), dividerMatrix)
+            cost_matrix = distance_matrix(A, RelBSubset)
+            # the Hungarian algorithm 
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            total_cost = cost_matrix[row_ind, col_ind].sum()
+            if total_cost<bestcost:
+                bestmap = [BSubset[idx] for idx in col_ind]
+                bestcost = total_cost
+    return bestmap
