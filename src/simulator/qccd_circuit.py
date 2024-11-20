@@ -507,7 +507,7 @@ def process_circuit(distance, capacity, gate_improvements, num_shots):
 
     logger.info(f"Processing circuit with {nqubitsNeeded} qubits and {nrowsNeeded} rows")
 
-    arch, (instructions, _) = circuit.processCircuitAugmentedGrid(rows=nrowsNeeded*nrowsNeeded, cols=1, trapCapacity=capacity)
+    arch, (instructions, _) = circuit.processCircuitAugmentedGrid(rows=nrowsNeeded, cols=nrowsNeeded, trapCapacity=capacity)
     # arch, (instructions, _) = circuit.processCircuitNetworkedGrid(traps=nqubitsNeeded, trapCapacity=capacity)
     arch.refreshGraph()
 
