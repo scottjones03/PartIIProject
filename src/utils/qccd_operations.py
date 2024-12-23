@@ -406,7 +406,7 @@ class Move(Operation):
 # TODO: junction crossing should really go over the junction to the next crossing
 class JunctionCrossing(Operation):
     KEY = Operations.JUNCTION_CROSSING
-    CROSSING_TIME = 100e-6  # TABLE I https://arxiv.org/pdf/2004.04706
+    CROSSING_TIME = 50e-6  # TABLE I https://arxiv.org/pdf/2004.04706
     HEATING_RATE = (
         3  # TABLE IV https://journals.aps.org/pra/pdf/10.1103/PhysRevA.99.022330
     )

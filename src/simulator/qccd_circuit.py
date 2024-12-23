@@ -82,6 +82,7 @@ class QCCDCircuit(stim.Circuit):
         self._measurementIons = []
         self._ionMapping = {}
         self._dataIons = []
+
         for j, i in enumerate(instructions):
             if not i.startswith("QUBIT_COORDS"):
                 break
@@ -308,14 +309,13 @@ class QCCDCircuit(stim.Circuit):
         logicalError = num_errors / num_shots 
         return logicalError, meanPhysicalXError, meanPhysicalZError
 
-
     def processCircuitAugmentedGrid(
         self,
         trapCapacity: int = 2,
         rows: int = 1,
         cols: int = 5,
         padding: int = 1,
-        dataQubitIdxs: Optional[Sequence[int]]=None
+        dataQubitIdxs: Optional[Sequence[int]]=None,
     ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
         instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
         if (trapCapacity-1) * ((rows-1) * (2*cols-1)+cols) < len(self._ionMapping):
@@ -331,7 +331,7 @@ class QCCDCircuit(stim.Circuit):
                 if c < cs-1 and r<rs-1:
                     allGridPos.append((2*c+1, 2*r+1)) 
 
-        gridPositions = arrangeClusters(clusters, allGridPos=allGridPos)
+        gridPositions = hillClimbOnArrangeClusters(clusters, allGridPos=allGridPos)
         gridPositions = [(c+padding, r+padding) for (c, r) in gridPositions]
         rows = rows+2*padding
         cols = cols+2*padding
@@ -353,7 +353,7 @@ class QCCDCircuit(stim.Circuit):
                     *self._gridToCoordinate((2*col, 2*row), trapCapacity),
                     ions,
                     color=self.TRAP_COLOR,
-                    isHorizontal=False,
+                    isHorizontal=(rows==1),
                     capacity=trapCapacity
                 )
                 self._originalArrangement[traps_dict[(2*col, 2*row)]] = ions
@@ -416,6 +416,8 @@ class QCCDCircuit(stim.Circuit):
                             traps_dict[(2*col+1, 2*row+1)], junctions_dict[(2*col + 2, 2*row+1)]
                         )
 
+        if any(i.parent is None for i in self._arch.ions.values()):
+            raise ValueError(f"Ions not in traps for {trapCapacity} and {len(self._measurementIons)+len(self._dataIons)}")
         return self._arch, (instructions, barriers)
     
 
@@ -503,12 +505,12 @@ def process_circuit(distance, capacity, gate_improvements, num_shots):
     )
     nqubitsNeeded = 2 * distance**2 - 1
 
-    nrowsNeeded = distance+2
+    nrowsNeeded = int(np.sqrt(nqubitsNeeded))+2
 
     logger.info(f"Processing circuit with {nqubitsNeeded} qubits and {nrowsNeeded} rows")
 
-    # arch, (instructions, _) = circuit.processCircuitAugmentedGrid(rows=nrowsNeeded, cols=nrowsNeeded, trapCapacity=capacity)
-    arch, (instructions, _) = circuit.processCircuitNetworkedGrid(traps=nqubitsNeeded, trapCapacity=capacity)
+    arch, (instructions, _) = circuit.processCircuitAugmentedGrid(rows=nrowsNeeded, cols=nrowsNeeded, trapCapacity=capacity)
+    # arch, (instructions, _) = circuit.processCircuitNetworkedGrid(traps=nqubitsNeeded, trapCapacity=capacity)
     arch.refreshGraph()
 
     results = {"ElapsedTime": {}, "Operations": {}, "MeanConcurrency": {}, "QubitOperations": {}, "LogicalErrorRates": {}, "PhysicalZErrorRates": {}, "PhysicalXErrorRates": {}}
@@ -517,8 +519,8 @@ def process_circuit(distance, capacity, gate_improvements, num_shots):
     label ="Forwarding"
 
     logger.info(f"Processing operations using {label} for distance {distance} and capacity {capacity}")
-    
     allOps, barriers = ionRouting(arch, instructions, capacity)
+ 
     parallelOpsMap = paralleliseOperationsWithBarriers(allOps, barriers)
     logicalErrors = []
     physicalZErrors = []
