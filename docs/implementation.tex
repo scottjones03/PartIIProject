@@ -1,0 +1,39 @@
+\chapter{Implementation} \label{chap:implementation}
+
+\section{Compiler Passes for Mapping Logical QEC Qubits to Hardware} \label{sec:logical_to_hardware_qubits}
+
+\par In topological codes with lattice surgery, it is advantageous to minimise data ion movement while allowing ancilla ions to travel since data ions do not undergo entanglement operations directly with each other. Ancilla ions perform parity checks, mediating interactions between data ions (\ref{fig:qubits_in_surface_code}). This setup partitions the code topology onto hardware such that neighbouring data ions are co-located in individual traps. In contrast, ancilla ions are initially distributed across traps and move between them as needed. The compiler, therefore, has two main algorithms: first, map the logical QEC qubits to ions; second, route the ancilla ions between traps for entanglement operations while ensuring the trap capacities are not violated.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth/3]{Figures/SurfaceCodeTopologyToQubits.png}
+    \caption{Distance-4 rotated surface code with red ancilla qubits and blue data qubits. Red and green shading indicate Z and X parity checks, respectively. There are no entanglement operations between data qubits, while every ancilla qubit has a two-qubit CNOT gate with every neighbouring data ion.}
+    \label{fig:qubits_in_surface_code}
+\end{figure}
+
+\clearpage
+
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/QubitsToIons.jpg}
+    \caption{Depiction of the problem of mapping qubits to ions in the QCCD hardware. Grey circles represent unused ions, while red and blue circles represent ancilla and data qubits, respectively.}
+    \label{fig:qubits_to_ions}
+\end{figure}
+
+\par The first compiler pass maps each qubit in the code's topology uniquely to an ion in the QCCD topology. This mapping is injective, as each qubit maps to a unique ion, but not all ions require a corresponding qubit. Figure~\ref{fig:qubits_to_ions} illustrates this mapping. Each QCCD trap has a capacity of 7, represented by 7 circles. Some traps in Figure~\ref{fig:qubits_to_ions} are overloaded to maximum capacity while other traps are not filled. However, overloading traps by filling them to maximum capacity is inefficient, as incoming ion movement would require displacing another ion. This increases noise and serialisation, delaying operations. Yet, a mapping that fills traps well below maximum capacity will increase the number of ion movements. In the following mapping of qubits to ions, traps are filled to \(capacity-1\) where possible to avoid serialisation while minimising ion movements.
+
+\par In Figure~\ref{fig:qubits_to_ions}, the mapping problem is framed as a bipartite graph matching. In the bipartite graph, vertices are divided into sets of qubits and sets of ions, with edges only between qubit vertices and ion vertices. A matching is a selection of edges such that no vertex is connected to more than one edge. The goal is to find a maximum matching, where the matching size equals the number of qubits. Finding a maximum matching is trivial when every qubit connects to every ion. However, suppose we assign weights to the edges, representing the cost of mapping a particular qubit to a specific ion. In that case, the problem reduces to finding a maximum matching with minimum total edge weight. This means selecting edges such that every vertex belongs to exactly one edge while minimising the sum of the weights of the chosen edges. This assignment problem can be reduced to a maximum flow problem when all allowed assignments have the same weight.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{Figures/QubitsToSingleIonTraps.jpeg}
+    \caption{Mapping qubits to traps with capacity 2 in a QCCD architecture. Each qubit is assigned to its trap while ensuring the ion reconfiguration costs are minimal by maintaining the same relative coordinates in hardware as in the QEC code topology.}
+    \label{fig:qubits_to_single_ion_traps}
+\end{figure}
+
+\par However, in practical scenarios, not all assignments have equal weights. It is advantageous to minimise ion reconfigurations by mapping qubits close in the code topology to ions co-located in the same trap in hardware. Qubits are assigned to individual single-ion traps for a QCCD architecture with trap capacity 2, as depicted in Figure~\ref{fig:qubits_to_single_ion_traps}. 
+
+\par The mapping problem of finding a minimum-weight maximum matching such that the size of the matching equals the number of qubits can be reduced to a minimum-weight perfect matching problem if the number of ions equals the number of qubits. Since there are initially more ions than qubits, the problem is translated by reducing the ion set to compact subsets of the same size as the qubit set. These subsets are centred on the QCCD topology to ensure compactness and preserve the relative qubit arrangement. The minimum-weight perfect matching is computed for each subset, and the subset with the highest total weight is selected. This approach is computationally efficient as it restricts the search space to compact subsets where the relative topology remains unchanged. Details of this constrained search are provided in Section \ref{subsec:perfect_match_setup}.
+
+\par \label{def:edge_weights_hungarian} The Hungarian algorithm is used to compute the matching minimum-weight perfect match. Edge weights are determined by initially mapping both the QEC and ion coordinate systems onto a unit square. The weight of an edge between a qubit at \(Q\) and an ion \(I\) is then \( \sum_{N \in KNN(Q)} ((x_I - x_N)^2 + (y_I - y_N)^2)\), where \(KNN(Q)\) represents the \(k\)-nearest neighbours (including \(Q\) itself) to the qubit \(Q\). Therefore, a minimum-weight matching minimises the relative Euclidean distance between all qubit neighbourhoods of size \(k\) and their corresponding ion neighbourhoods in the hardware, where the choice of \(k\) is dependent on the weight of the stabilisers in the QEC code. In Figure \ref{fig:qubits_to_single_ion_traps}, the matching achieves a perfect mapping, with qubits and ions aligned exactly, resulting in a total weight of 0.

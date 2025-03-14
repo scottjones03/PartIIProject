@@ -116,6 +116,7 @@ class OneQubitGate(QubitOperation):
             - (self._trap.backgroundHeatingRate * self.operationTime()
             + self.A * n * (2 * self._trap.motionalMode + 1))
         )
+        # self._fidelity = 1-3e-3
 
     def calculateDephasingFidelity(self) -> None:
         self._dephasingFidelity = 1 # FIXME might be inaccurate
@@ -215,6 +216,7 @@ class TwoQubitMSGate(QubitOperation):
     KEY = Operations.TWO_QUBIT_MS_GATE
     A = 0.003680029  # Scaling factor for fidelity calculation
     T2 =2.2
+    OP_TIME = 40e-6#+850e-6 # Remember to change WISE values
 
     def __init__(
         self,
@@ -247,7 +249,7 @@ class TwoQubitMSGate(QubitOperation):
         #     self._operationTime =  max(5 * distance + 160, 0) * 1e-6
         # elif self.gateType == "FM":
         #     self._operationTime = max(13.33 * chainLength - 54, 100) * 1e-6
-        self._operationTime = 40e-6
+        self._operationTime = self.OP_TIME
 
     def calculateFidelity(self) -> None:
         if self._trap is None:
@@ -264,6 +266,8 @@ class TwoQubitMSGate(QubitOperation):
             - (self._trap.backgroundHeatingRate * self.operationTime()
             + self.A * n * (2 * self._trap.motionalMode + 1))
         )
+
+        # self._fidelity = 1-2e-3
 
     def calculateDephasingFidelity(self) -> None:
         self.calculateOperationTime()

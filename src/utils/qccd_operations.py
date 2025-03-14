@@ -4,7 +4,8 @@ from typing import (
     List,
     Optional,
     Callable,
-    Any
+    Any,
+    Mapping
 )
 import abc
 from src.utils.qccd_nodes import *
@@ -121,6 +122,91 @@ class CrystalOperation(Operation):
         for ion in self._involvedIonsForLabel:
             self._addOns += f" {ion.label}"
 
+
+class GlobalReconfigurations(Operation):
+    KEY = Operations.GLOBAL_RECONFIG
+
+    def __init__(
+        self,
+        run: Callable[[Any], None],
+        involvedComponents: Sequence[QCCDComponent],
+        **kwargs,
+    ) -> None:
+        super().__init__(run, involvedComponents=involvedComponents, **kwargs)
+        self._wiseArch: QCCDWiseArch = kwargs['wiseArch']
+
+
+    @staticmethod
+    def _calculateHeatingRate(wiseArch: QCCDWiseArch) -> float:
+        globalHeatingRate = 0.0
+
+        globalHeatingRate+=Split.HEATING_RATE/wiseArch.k+Move.HEATING_RATE+JunctionCrossing.HEATING_RATE
+
+        globalHeatingRate+=Merge.HEATING_RATE/wiseArch.k+Move.HEATING_RATE+JunctionCrossing.HEATING_RATE
+        return globalHeatingRate
+    
+    @staticmethod
+    def _calculateReconfigTime(wiseArch: QCCDWiseArch) -> float:
+        globalReconfigTime = 0.0
+
+        globalReconfigTime+=Split.SPLITTING_TIME+Move.MOVING_TIME+JunctionCrossing.CROSSING_TIME
+   
+        nrswaps = wiseArch.m
+        globalReconfigTime+=PhysicalCrossingSwap.CROSSING_TIME*nrswaps
+        for i in range(wiseArch.k):
+            ncswaps =wiseArch.n
+            globalReconfigTime+=(JunctionCrossing.CROSSING_TIME+Move.MOVING_TIME+PhysicalCrossingSwap.CROSSING_TIME+Move.MOVING_TIME+JunctionCrossing.CROSSING_TIME)*ncswaps
+            globalReconfigTime+=Split.SPLITTING_TIME+Move.MOVING_TIME+JunctionCrossing.CROSSING_TIME+PhysicalCrossingSwap.CROSSING_TIME+JunctionCrossing.CROSSING_TIME+Move.MOVING_TIME+Merge.MERGING_TIME #Row swap
+            globalReconfigTime+=3*40e-6 #Move Ion to Back of Queue
+
+        nrswaps = wiseArch.m
+
+        globalReconfigTime+=PhysicalCrossingSwap.CROSSING_TIME*nrswaps
+
+        globalReconfigTime+=Merge.MERGING_TIME
+        return globalReconfigTime
+    
+    def calculateOperationTime(self) -> None:
+        self._operationTime =  GlobalReconfigurations._calculateReconfigTime(self._wiseArch)
+
+    def calculateFidelity(self) -> None:
+        self._fidelity = 1  # NOISE INCORPORATED INTO HEATING MODEL
+
+    def calculateDephasingFidelity(self) -> None:
+        # FIXME might be inaccurate
+        self.calculateOperationTime()
+        self._dephasingFidelity = 1 - (1-np.exp(-self.operationTime()/2.2))/2  # Dephasing noise https://journals.aps.org/pra/pdf/10.1103/PhysRevA.99.022330
+
+
+    def _generateLabelAddOns(self) -> None:
+        self._addOns = f""
+
+    @property
+    def isApplicable(self) -> bool:
+        return True
+    
+    def _checkApplicability(self) -> None:
+        return True
+
+    @classmethod
+    def physicalOperation(
+        cls, arrangement: Mapping[Trap, Sequence[Ion]], wiseArch: QCCDWiseArch
+    ):
+        def run():
+            reconfigTime = cls._calculateReconfigTime(wiseArch)
+            heatingRate = cls._calculateHeatingRate(wiseArch)
+            for trap in arrangement.keys():
+                while trap.ions:
+                    trap.removeIon(trap.ions[0])
+            for trap, ions in arrangement.items():
+                for i, ion in enumerate(ions):
+                    trap.addIon(ion, offset=i)
+                    ion.addMotionalEnergy(reconfigTime*heatingRate)
+        return cls(
+            run=lambda _: run(),
+            involvedComponents=list(arrangement.keys()),
+            wiseArch=wiseArch
+        )
 
 
 class Split(CrystalOperation):

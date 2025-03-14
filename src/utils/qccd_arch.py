@@ -9,7 +9,7 @@ from typing import (
 )
 from matplotlib import pyplot as plt
 import networkx as nx
-
+from dataclasses import dataclass
 from matplotlib.patches import Ellipse
 from src.utils.qccd_nodes import *
 from src.utils.qccd_operations import *
@@ -438,3 +438,4 @@ class QCCDArch:
         ax.set_title(title, fontsize=self.FONT_SIZE*5)
         n = len(fig.axes)
         fig.set_size_inches(self.WINDOW_SIZE[0]*n, self.WINDOW_SIZE[1])
+

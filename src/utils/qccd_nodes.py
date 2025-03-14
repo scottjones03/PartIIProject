@@ -4,11 +4,13 @@ from typing import (
     List,
     Tuple,
     Optional,
-    Union
+    Union,
+    Mapping
 )
 import networkx as nx
 import enum
 import abc
+from dataclasses import dataclass
 
 
 class Operations(enum.Enum):
@@ -29,6 +31,7 @@ class Operations(enum.Enum):
     # TODO need to add recooling operation
     RECOOLING = enum.auto()
     PARALLEL = enum.auto()
+    GLOBAL_RECONFIG = enum.auto()
 
 class QCCDComponent:
     @property
@@ -227,7 +230,8 @@ class Junction(QCCDNode):
 
 
 class Trap(QCCDNode):
-    BACKGROUND_HEATING_RATE = 39.996319971  # Arbitrary heating rate in quanta per second
+    # BACKGROUND_HEATING_RATE = 39.996319971  # Arbitrary heating rate in quanta per second
+    BACKGROUND_HEATING_RATE = 3.9996319971
     CAPACITY_SCALING = 1
 
     def __init__(
@@ -443,3 +447,10 @@ class Crossing:
     @property
     def allowedOperations(self) -> Sequence[Operations]:
         return [Operations.SPLIT, Operations.MOVE, Operations.MERGE, Operations.JUNCTION_CROSSING]
+
+
+@dataclass
+class QCCDWiseArch:
+    m: int
+    n: int
+    k: int

@@ -1,0 +1,526 @@
+QCCDSim
+
+
+linear, ion_chain_size=1
+
+
+commcap =2 , cap=1 gave poor results
+programs/repetitioncode3.qasm = {elapsed =667 , split = 6, move = 6, merge = 6, SplitSWAP = 2}
+programs/repetitioncode5.qasm = {elapsed = 1500, split = 16, move = 16, merge = 16, SplitSWAP = 4}
+programs/repetitioncode7.qasm = {elapsed = 1500, split = 22, move = 22, merge = 22, SplitSWAP = 4}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 3826, split = 26, move = 26, merge = 26, SplitSWAP = 8}
+programs/repetitioncode5rounds5.qasm = {elapsed = 8011, split = 76, move = 76, merge =76 , SplitSWAP = 33}
+programs/repetitioncode7rounds5.qasm = {elapsed = 10637, split = 137, move = , merge = , SplitSWAP = 37}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 2167, split = 17, move = , merge = , SplitSWAP = 7}
+programs/rotatedsurface3.qasm = {elapsed = 11656, split = 103, move = , merge = , SplitSWAP = 50}
+programs/rotatedsurface4.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 10163, split =81 , move = , merge = , SplitSWAP = 27}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 113803, split = 869, move = , merge = , SplitSWAP = 418}
+programs/rotatedsurface4rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 4337, split = 36, move = , merge = , SplitSWAP = 20}
+programs/unrotatedsurface3.qasm = {elapsed = 24845, split = 250, move = , merge = , SplitSWAP = 132}
+
+
+
+grid, ion_chain_size=1
+
+comcap=1 reasonable?
+programs/repetitioncode3.qasm = {elapsed = 532, split = 4, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode5.qasm = {elapsed = 1068, split = 13, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode7.qasm = {elapsed = 1598, split = 23, move = , merge = , SplitSWAP = 3}
+
+commcap=2 needed!
+programs/repetitioncode3rounds5.qasm = {elapsed = 2660, split = 14, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode5rounds5.qasm = {elapsed = 5045, split = 50, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode7rounds5.qasm = {elapsed = 5045, split = 79, move = , merge = , SplitSWAP = 0}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 1972, split = 10, move = , merge = , SplitSWAP = 3}
+programs/rotatedsurface3.qasm = {elapsed = 3591, split = 37, move = , merge = , SplitSWAP = 10}
+programs/rotatedsurface4.qasm = {elapsed = 5531, split = 87, move = , merge = , SplitSWAP = 26}
+programs/rotatedsurface5.qasm = {elapsed = 9453, split = 160, move = , merge = , SplitSWAP = 56}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 9860, split = 50, move = , merge = , SplitSWAP = 15}
+needs much larger comm cap ! (20)
+programs/rotatedsurface3rounds5.qasm = {elapsed = 36010 split = 273, move = , merge = , SplitSWAP = 95}
+programs/rotatedsurface4rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 2339, split = 22, move = , merge = , SplitSWAP = 5}
+programs/unrotatedsurface3.qasm = {elapsed = 7701, split = 79, move = , merge = , SplitSWAP = 28}
+
+
+linear, ion_chain_size=2
+
+programs/repetitioncode3.qasm = {elapsed = 503, split = 4, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5.qasm = {elapsed = 668, split = 7, move = , merge = , SplitSWAP = 3}
+programs/repetitioncode7.qasm = {elapsed = 668, split = 9, move = , merge = , SplitSWAP = 3}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 3160, split = 22, move = , merge = , SplitSWAP = 5}
+programs/repetitioncode5rounds5.qasm = {elapsed = 4012, split = 39, move = , merge = , SplitSWAP = 15}
+programs/repetitioncode7rounds5.qasm = {elapsed = 4012, split = 57, move = , merge = , SplitSWAP = 15}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 835, split = 9, move = , merge = , SplitSWAP = 4}
+programs/rotatedsurface3.qasm = {elapsed = 6692, split = 59, move = , merge = , SplitSWAP = 44}
+programs/rotatedsurface4.qasm = {elapsed = 18959, split = 183, move = , merge = , SplitSWAP = 156}
+programs/rotatedsurface5.qasm = {elapsed = 35212, split = 391, move = , merge = , SplitSWAP = 334}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 6181, split = 57, move = , merge = , SplitSWAP = 21}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 43049, split = 361, move = , merge = , SplitSWAP = 282}
+programs/rotatedsurface4rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 2175, split = 19, move = , merge = , SplitSWAP = 13}
+programs/unrotatedsurface3.qasm = {elapsed = 13922, split = 135, move = , merge = , SplitSWAP = 120}
+
+
+
+grid, ion_chain_size=2
+
+programs/repetitioncode3.qasm = {elapsed = 502, split = 3, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5.qasm = {elapsed = 1068, split = 7, move = , merge = , SplitSWAP = 3}
+programs/repetitioncode7.qasm = {elapsed = 1068, split = 9, move = , merge = , SplitSWAP = 3}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 1830, split = 11, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5rounds5.qasm = {elapsed = 6412, split = 39, move = , merge = , SplitSWAP = 15}
+programs/repetitioncode7rounds5.qasm = {elapsed = 6412, split = 57, move = , merge = , SplitSWAP = 19}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 1007, split = 6, move = , merge = , SplitSWAP = 5}
+programs/rotatedsurface3.qasm = {elapsed = 5030, split = 32, move = , merge = , SplitSWAP = 24}
+programs/rotatedsurface4.qasm = {elapsed = 6360, split = 69, move = , merge = , SplitSWAP = 51}
+programs/rotatedsurface5.qasm = {elapsed = 9149, split = 121, move = , merge = , SplitSWAP = 84}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 3836, split = 23, move = , merge = , SplitSWAP = 8}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 33972, split = 196, move = , merge = , SplitSWAP = 163}
+programs/rotatedsurface4rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 3070, split = 14, move = , merge = , SplitSWAP = 8}
+programs/unrotatedsurface3.qasm = {elapsed = 4914, split = 54, move = , merge = , SplitSWAP = 34}
+
+
+
+linear, ion_chain_size=5
+
+programs/repetitioncode3.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5.qasm = {elapsed = 335, split = 2, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 335, split = 3, move = , merge = , SplitSWAP = 1}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5rounds5.qasm = {elapsed = 1663, split = 10, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 1663, split = 19, move = , merge = , SplitSWAP = 1}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 498, split = 3, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3.qasm = {elapsed = 2175, split = 22, move = , merge = , SplitSWAP = 15}
+programs/rotatedsurface4.qasm = {elapsed = 10570, split = 85, move = , merge = , SplitSWAP = 74}
+programs/rotatedsurface5.qasm = {elapsed = 12924, split = 138, move = , merge = , SplitSWAP =127}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 3154, split = 19, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 19972, split = 159, move = , merge = , SplitSWAP = 144}
+programs/rotatedsurface4rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 1343, split = 8, move = , merge = , SplitSWAP = 7}
+programs/unrotatedsurface3.qasm = {elapsed = 4192, split = 46, move = , merge = , SplitSWAP = 42}
+
+
+
+
+grid, ion_chain_size=5
+
+programs/repetitioncode3.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5.qasm = {elapsed = 335, split = 2, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 506, split =3, move = , merge = , SplitSWAP =3 }
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5rounds5.qasm = {elapsed = 1663, split = 10, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 1663, split = 19, move = , merge = , SplitSWAP = 1}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 498, split = 3, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3.qasm = {elapsed = 2889, split =15 , move = , merge = , SplitSWAP = 11}
+programs/rotatedsurface4.qasm = {elapsed = 4223, split = 48, move = , merge = , SplitSWAP = 30}
+programs/rotatedsurface5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 3154, split = 19, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 24777, split = 121, move = , merge = , SplitSWAP = 109}
+programs/rotatedsurface4rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+programs/rotatedsurface5rounds5.qasm = {elapsed = -, split = , move = , merge = , SplitSWAP = }
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 1343, split = 8, move = , merge = , SplitSWAP = 7}
+programs/unrotatedsurface3.qasm = {elapsed = 5941, split = 34, move = , merge = , SplitSWAP = 30}
+
+
+
+MuzzleShuttle
+
+
+linear, ion_chain_size=1
+
+programs/repetitioncode3.qasm = {elapsed = 835, split = 6, move = , merge = , SplitSWAP = 3}
+programs/repetitioncode5.qasm = {elapsed = 1334, split = 15, move = , merge = , SplitSWAP = 4}
+programs/repetitioncode7.qasm = {elapsed = 1334, split = 21, move = , merge = , SplitSWAP = 4}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 2163, split = 14, move = , merge = , SplitSWAP = 3}
+programs/repetitioncode5rounds5.qasm = {elapsed = 7307, split = 71, move = , merge = , SplitSWAP = 12}
+programs/repetitioncode7rounds5.qasm = {elapsed = 7307, split = 109, move = , merge = , SplitSWAP = 12}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 1171, split = 12, move = , merge = , SplitSWAP = 5}
+comm_cap = 6 !!!
+programs/rotatedsurface3.qasm = {elapsed =11956, split = 98, move = , merge = , SplitSWAP = 37}
+programs/rotatedsurface4.qasm = {elapsed = 24817, split =267 , move = , merge = , SplitSWAP = 122}
+programs/rotatedsurface5.qasm = {elapsed = 53552, split = 595, move = , merge = , SplitSWAP =255 }
+
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 6504, split = 52, move = , merge = , SplitSWAP = 20}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 77019, split =559 , move = , merge = , SplitSWAP = 137}
+comm_cap = 12 !!!
+programs/rotatedsurface4rounds5.qasm = {elapsed = 124663, split = 1245, move = , merge = , SplitSWAP = 369}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 279649, split = 3196, move = , merge = , SplitSWAP = 914}
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 2667, split = 25, move = , merge = , SplitSWAP = 10}
+programs/unrotatedsurface3.qasm = {elapsed = 20452, split = 219, move = , merge = , SplitSWAP = 90}
+
+
+
+grid, ion_chain_size=1
+
+programs/repetitioncode3.qasm = {elapsed = 532, split = 4, move = , merge = , SplitSWAP =0 }
+programs/repetitioncode5.qasm = {elapsed = 797, split = 9, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode7.qasm = {elapsed = 902, split = 15, move = , merge = , SplitSWAP = 0}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 2660, split = 12, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode5rounds5.qasm = {elapsed = 5045, split = 41, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode7rounds5.qasm = {elapsed = 5150, split = 79, move = , merge = , SplitSWAP = 0}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 2585, split = 12, move = , merge = , SplitSWAP = 4}
+comm_cap = 6 !!!!
+programs/rotatedsurface3.qasm = {elapsed = 3031, split = 36, move = , merge = , SplitSWAP = 5}
+programs/rotatedsurface4.qasm = {elapsed = 4384, split = 71, move = , merge = , SplitSWAP = 17}
+programs/rotatedsurface5.qasm = {elapsed = 8639, split = 138, move = , merge = , SplitSWAP = 37}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 16189, split = 72, move = , merge = , SplitSWAP = 34}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 22640, split =159, move = , merge = , SplitSWAP = 34}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 42492, split = 395, move = , merge = , SplitSWAP = 123}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 52477, split = 710, move = , merge = , SplitSWAP = 192}
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 5242, split = 27, move = , merge = , SplitSWAP = 8}
+comm_cap = 6 !!!
+programs/unrotatedsurface3.qasm = {elapsed = 8035, split = 69, move = , merge = , SplitSWAP = 19}
+
+
+linear, ion_chain_size=2
+
+programs/repetitioncode3.qasm = {elapsed = 338, split = 3, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5.qasm = {elapsed = 668, split = 7, move = , merge = , SplitSWAP = 3}
+programs/repetitioncode7.qasm = {elapsed = 668, split = 9, move = , merge = , SplitSWAP = 3}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 1666, split = 11, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5rounds5.qasm = {elapsed = 4024, split = 39, move = , merge = , SplitSWAP = 19}
+programs/repetitioncode7rounds5.qasm = {elapsed = 4024, split = 57, move = , merge = , SplitSWAP =19 }
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 1674, split = 12, move = , merge = , SplitSWAP = 7}
+programs/rotatedsurface3.qasm = {elapsed = 5833, split = 49, move = , merge = , SplitSWAP = 26}
+comm_cap = 6 !!
+programs/rotatedsurface4.qasm = {elapsed = 12877, split = 139, move = , merge = , SplitSWAP = 94}
+programs/rotatedsurface5.qasm = {elapsed = 47590, split = 392, move = , merge = , SplitSWAP = 257}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 5477, split = 35, move = , merge = , SplitSWAP = 6}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 37698, split = 273, move = , merge = , SplitSWAP = 113}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 65677, split = 644, move = , merge = , SplitSWAP = 344}
+comm_cap = 12 !!
+programs/rotatedsurface5rounds5.qasm = {elapsed = 237427, split = 1944, move = , merge = , SplitSWAP = 1109}
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 1510, split = 14, move = , merge = , SplitSWAP = 9}
+comm_cap = 6 !!!
+programs/unrotatedsurface3.qasm = {elapsed = 10195, split = 106, move = , merge = , SplitSWAP = 76}
+
+
+
+grid, ion_chain_size=2
+
+programs/repetitioncode3.qasm = {elapsed = 502, split = 3, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5.qasm = {elapsed = 1068, split = 7, move = , merge = , SplitSWAP = 3}
+programs/repetitioncode7.qasm = {elapsed = 1068, split = 9, move = , merge = , SplitSWAP = 5}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 2666, split = 11, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5rounds5.qasm = {elapsed = 7172, split = 39, move = , merge = , SplitSWAP = 23}
+programs/repetitioncode7rounds5.qasm = {elapsed = 7172, split = 57, move = , merge = , SplitSWAP = 25}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 506, split = 3, move = , merge = , SplitSWAP =3}
+comm_cap = 6 !!!
+programs/rotatedsurface3.qasm = {elapsed = 2594, split = 25, move = , merge = , SplitSWAP = 13}
+programs/rotatedsurface4.qasm = {elapsed = 4639, split = 59, move = , merge = , SplitSWAP = 26}
+programs/rotatedsurface5.qasm = {elapsed = 5981, split = 98, move = , merge = , SplitSWAP = 50}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 351, split = 2, move = , merge = , SplitSWAP = 1}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 16371, split = 118, move = , merge = , SplitSWAP = 52}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 26792, split = 252, move = , merge = , SplitSWAP = 114}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 36070, split = 554, move = , merge = , SplitSWAP = 232}
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 3131, split = 13, move = , merge = , SplitSWAP = 10}
+comm_cap = 6 !!!
+programs/unrotatedsurface3.qasm = {elapsed = 3881, split = 47, move = , merge = , SplitSWAP = 28}
+
+
+
+linear, ion_chain_size=5
+
+programs/repetitioncode3.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5.qasm = {elapsed = 335, split = 2, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 335, split = 3, move = , merge = , SplitSWAP = 1}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5rounds5.qasm = {elapsed = 1663, split = 10, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 1663, split = 19, move = , merge = , SplitSWAP = 1}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 504, split = 3, move = , merge = , SplitSWAP = 2}
+comm_cap = 6 !!!
+programs/rotatedsurface3.qasm = {elapsed = 2016, split =20 , move = , merge = , SplitSWAP = 16}
+programs/rotatedsurface4.qasm = {elapsed = 4357, split = 51, move = , merge = , SplitSWAP = 41}
+programs/rotatedsurface5.qasm = {elapsed = 10729, split = 118, move = , merge = , SplitSWAP = 95}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 352, split = 2, move = , merge = , SplitSWAP = 1}
+comm_cap = 12 !!!
+programs/rotatedsurface3rounds5.qasm = {elapsed = 4508, split = 33, move = , merge = , SplitSWAP = 15}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 22044, split = 234, move = , merge = , SplitSWAP = 154}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 53239, split = 628, move = , merge = , SplitSWAP = 459}
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 1172, split = 7, move = , merge = , SplitSWAP = 5}
+programs/unrotatedsurface3.qasm = {elapsed = 5192, split = 47, move = , merge = , SplitSWAP = 40}
+
+
+
+grid, ion_chain_size=5
+
+programs/repetitioncode3.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5.qasm = {elapsed = 335, split = 2, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 535, split = 3, move = , merge = , SplitSWAP = 1}
+
+programs/repetitioncode3rounds5.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5rounds5.qasm = {elapsed = 2663, split = 10, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 2663, split = 19, move = , merge = , SplitSWAP = 1}
+
+
+
+programs/rotatedsurface2.qasm = {elapsed = 504, split = 3, move = , merge = , SplitSWAP = 2}
+comm_cap = 6 !!!
+programs/rotatedsurface3.qasm = {elapsed = 2806, split = 14, move = , merge = , SplitSWAP = 8}
+programs/rotatedsurface4.qasm = {elapsed = 4029, split = 19, move = , merge = , SplitSWAP = 19}
+programs/rotatedsurface5.qasm = {elapsed = 4938, split = 64, move = , merge = , SplitSWAP = 47}
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 552, split = 2, move = , merge = , SplitSWAP = 1}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 19544, split = 92, move = , merge = , SplitSWAP = 44}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 28804, split = 197, move = , merge = , SplitSWAP = 101}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 34887, split = 356, move = , merge = , SplitSWAP = 252}
+
+
+programs/unrotatedsurface2.qasm = {elapsed = 1172, split = 7, move = , merge = , SplitSWAP = 5}
+programs/unrotatedsurface3.qasm = {elapsed = 1679, split = 10, move = , merge = , SplitSWAP = 9}
+
+
+PartIIProject
+linear, ion_chain_size=1
+
+programs/repetitioncode3.qasm = {elapsed = 660, split = 8, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode5.qasm = {elapsed = 660, split = 16, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode7.qasm = {elapsed = 660, split = 24, move = , merge = , SplitSWAP = 0}
+DONE
+programs/repetitioncode3rounds5.qasm = {elapsed = 3300, split = 40, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode5rounds5.qasm = {elapsed = 3300, split = 80, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode7rounds5.qasm = {elapsed = 3300, split = 120, move = , merge = , SplitSWAP = 0}
+DONE
+
+
+programs/rotatedsurface2.qasm = {elapsed = 6270, split = 40, move = , merge = , SplitSWAP = 24}
+programs/rotatedsurface3.qasm = {elapsed =12870, split = 134, move = , merge = , SplitSWAP = 86}
+programs/rotatedsurface4.qasm = {elapsed = 25080, split =388 , move = , merge = , SplitSWAP = 292}
+programs/rotatedsurface5.qasm = {elapsed = 38940, split = 792, move = , merge = , SplitSWAP =632 }
+DONE
+
+programs/rotatedsurface2rounds5.qasm = {elapsed = 30030, split = 200, move = , merge = , SplitSWAP = 120}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 59070, split =670 , move = , merge = , SplitSWAP = 430}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 114840, split = 1940, move = , merge = , SplitSWAP = 1460}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 182820, split = 3960, move = , merge = , SplitSWAP = 3160}
+DONE
+
+programs/unrotatedsurface2.qasm = {elapsed = 5940, split = 50, move = , merge = , SplitSWAP = 26}
+programs/unrotatedsurface3.qasm = {elapsed = 20130, split = 256, move = , merge = , SplitSWAP = 176}
+DONE
+
+
+grid, ion_chain_size=1
+
+programs/repetitioncode3.qasm = {elapsed = 1080, split = 8, move = , merge = , SplitSWAP =0 }
+programs/repetitioncode5.qasm = {elapsed = 2970, split = 21, move = , merge = , SplitSWAP = 4}
+programs/repetitioncode7.qasm = {elapsed = 2970, split = 36, move = , merge = , SplitSWAP = 4}
+DONE
+programs/repetitioncode3rounds5.qasm = {elapsed = 5400, split = 40, move = , merge = , SplitSWAP = 0}
+programs/repetitioncode5rounds5.qasm = {elapsed = 13770, split = 101, move = , merge = , SplitSWAP = 20}
+programs/repetitioncode7rounds5.qasm = {elapsed = 14310, split = 165, move = , merge = , SplitSWAP = 28}
+DONE
+
+
+programs/rotatedsurface2.qasm = {elapsed = 2700, split = 16, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3.qasm = {elapsed = 2700, split = 48, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface4.qasm = {elapsed = 2700, split = 96, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface5.qasm = {elapsed = 2700, split = 160, move = , merge = , SplitSWAP = 0}
+DONE
+programs/rotatedsurface2rounds5.qasm = {elapsed = 10800, split = 80, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 13500, split =240, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 13500, split = 480, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 13500, split = 800, move = , merge = , SplitSWAP = 0}
+DONE
+
+programs/unrotatedsurface2.qasm = {elapsed = 3510, split = 33, move = , merge = , SplitSWAP = 0}
+programs/unrotatedsurface3.qasm = {elapsed = 4860, split = 96, move = , merge = , SplitSWAP = 16}
+DONE
+
+linear, ion_chain_size=2
+
+programs/repetitioncode3.qasm = {elapsed = 495, split = 3, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode5.qasm = {elapsed = 660, split = 7, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 990, split = 11, move = , merge = , SplitSWAP = 4}
+DONE
+programs/repetitioncode3rounds5.qasm = {elapsed = 3135, split = 19, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode5rounds5.qasm = {elapsed = 3960, split = 42, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 4945, split = 65, move = , merge = , SplitSWAP =4 }
+DONE
+
+
+programs/rotatedsurface2.qasm = {elapsed = 3135, split = 20, move = , merge = , SplitSWAP = 10}
+programs/rotatedsurface3.qasm = {elapsed = 7260, split = 84, move = , merge = , SplitSWAP = 53}
+programs/rotatedsurface4.qasm = {elapsed = 19055, split = 241, move = , merge = , SplitSWAP = 176}
+programs/rotatedsurface5.qasm = {elapsed = 33990, split = 348, move = , merge = , SplitSWAP = 484}
+DONE
+programs/rotatedsurface2rounds5.qasm = {elapsed = 16335, split = 100, move = , merge = , SplitSWAP = 50}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 36790, split = 416, move = , merge = , SplitSWAP = 268}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 86700, split = 1111, move = , merge = , SplitSWAP = 767}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 177615, split = 2528, move = , merge = , SplitSWAP = 1799}
+DONE
+
+programs/unrotatedsurface2.qasm = {elapsed = 4290, split = 29, move = , merge = , SplitSWAP = 15}
+programs/unrotatedsurface3.qasm = {elapsed = 12210, split = 141, move = , merge = , SplitSWAP = 95}
+DONE
+
+
+grid, ion_chain_size=2
+
+
+programs/repetitioncode3.qasm = {elapsed = 540, split = 3, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5.qasm = {elapsed = 2160, split = 13, move = , merge = , SplitSWAP = 5}
+programs/repetitioncode7.qasm = {elapsed = 2430, split = 14, move = , merge = , SplitSWAP = 5}
+DONE
+programs/repetitioncode3rounds5.qasm = {elapsed = 3510, split = 19, move = , merge = , SplitSWAP = 2}
+programs/repetitioncode5rounds5.qasm = {elapsed = 11690, split = 62, move = , merge = , SplitSWAP = 11}
+programs/repetitioncode7rounds5.qasm = {elapsed = 10500, split = 87, move = , merge = , SplitSWAP = 13}
+DONE
+
+
+programs/rotatedsurface2.qasm = {elapsed = 3590, split = 16, move = , merge = , SplitSWAP =1}
+programs/rotatedsurface3.qasm = {elapsed = 3860, split = 39, move = , merge = , SplitSWAP = 13}
+programs/rotatedsurface4.qasm = {elapsed = 6910, split = 87, move = , merge = , SplitSWAP = 27}
+programs/rotatedsurface5.qasm = {elapsed = 9450, split = 156, move = , merge = , SplitSWAP = 44}
+DONE
+programs/rotatedsurface2rounds5.qasm = {elapsed = 15980, split = 80, move = , merge = , SplitSWAP = 1}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 19410, split = 192, move = , merge = , SplitSWAP = 51}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 29610, split = 423, move = , merge = , SplitSWAP = 109}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 47920, split = 790, move = , merge = , SplitSWAP = 195}
+DONE
+
+programs/unrotatedsurface2.qasm = {elapsed = 2320, split = 18, move = , merge = , SplitSWAP = 6}
+programs/unrotatedsurface3.qasm = {elapsed = 6830, split = 71, move = , merge = , SplitSWAP = 30}
+DONE
+
+
+linear, ion_chain_size=5
+
+programs/repetitioncode3.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5.qasm = {elapsed = 330, split = 2, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 660, split = 4, move = , merge = , SplitSWAP = 1}
+DONE
+programs/repetitioncode3rounds5.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5rounds5.qasm = {elapsed = 1650, split = 10, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 3300, split = 20, move = , merge = , SplitSWAP = 1}
+DONE
+
+
+programs/rotatedsurface2.qasm = {elapsed = 495, split = 3, move = , merge = , SplitSWAP = 1}
+programs/rotatedsurface3.qasm = {elapsed = 3630, split = 25, move = , merge = , SplitSWAP = 16}
+programs/rotatedsurface4.qasm = {elapsed = 10140, split = 69, move = , merge = , SplitSWAP = 84}
+programs/rotatedsurface5.qasm = {elapsed = 13115, split = 124, move = , merge = , SplitSWAP = 151}
+DONE
+programs/rotatedsurface2rounds5.qasm = {elapsed = 3135, split = 19, move = , merge = , SplitSWAP = 1}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 23430, split = 153, move = , merge = , SplitSWAP = 102}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 54675, split = 456, move = , merge = , SplitSWAP = 383}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 74970, split = 914, move = , merge = , SplitSWAP = 739}
+DONE
+
+programs/unrotatedsurface2.qasm = {elapsed = 1980, split = 12, move = , merge = , SplitSWAP = 9}
+programs/unrotatedsurface3.qasm = {elapsed = 7425, split = 65, move = , merge = , SplitSWAP = 50}
+DONE
+
+
+grid, ion_chain_size=5
+
+programs/repetitioncode3.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5.qasm = {elapsed = 540, split = 2, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7.qasm = {elapsed = 890, split = 4, move = , merge = , SplitSWAP = 1}
+DONE
+programs/repetitioncode3rounds5.qasm = {elapsed = 0, split = , move = , merge = , SplitSWAP = }
+programs/repetitioncode5rounds5.qasm = {elapsed = 2700, split = 10, move = , merge = , SplitSWAP = 1}
+programs/repetitioncode7rounds5.qasm = {elapsed = 4370, split = 20, move = , merge = , SplitSWAP = 1}
+DONE
+
+
+programs/rotatedsurface2.qasm = {elapsed = 1620, split = 6, move = , merge = , SplitSWAP = 0}
+programs/rotatedsurface3.qasm = {elapsed = 4670, split =25 , move = , merge = , SplitSWAP = 9}
+programs/rotatedsurface4.qasm = {elapsed = 5830, split = 48, move = , merge = , SplitSWAP = 16}
+programs/rotatedsurface5.qasm = {elapsed = 5530, split = 73, move = , merge = , SplitSWAP = 44}
+DONE
+programs/rotatedsurface2rounds5.qasm = {elapsed = 10260, split = 38, move = , merge = , SplitSWAP = 2}
+programs/rotatedsurface3rounds5.qasm = {elapsed = 22560, split = 143, move = , merge = , SplitSWAP = 32}
+programs/rotatedsurface4rounds5.qasm = {elapsed = 30300, split = 259, move = , merge = , SplitSWAP = 91}
+programs/rotatedsurface5rounds5.qasm = {elapsed = 40460, split = 518, move = , merge = , SplitSWAP = 186}
+DONE
+
+programs/unrotatedsurface2.qasm = {elapsed = 2430, split = 9, move = , merge = , SplitSWAP = 6}
+programs/unrotatedsurface3.qasm = {elapsed = 6910, split = 52, move = , merge = , SplitSWAP = 22}
+DONE

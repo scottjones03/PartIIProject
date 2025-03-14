@@ -76,6 +76,7 @@ def regularPartition(measurementIons: Sequence[Ion], dataIons: Sequence[Ion], tr
                 return clusters
 
 
+
 def _minWeightPerfectMatch(A, BSubset, centralizerMatrix, dividerMatrix, nearestCoordsA, nearestDistsA) -> Tuple[float, Sequence[int]]:
     RelBSubset = np.divide((BSubset-centralizerMatrix), dividerMatrix)
     try:
@@ -293,6 +294,8 @@ def hillClimbOnArrangeClusters(
                 besti = i 
                 nextcost = _cost 
                 nextmap = _map 
+            if nextcost == 0:
+                break
         if besti < 10 and nextcost<currentcost:
             return nextmap
         if nextcost>=currentcost:

@@ -38,6 +38,13 @@ def paralleliseOperationsSimple(
     return parallelOperationsSequence
 
 def calculateDephasingFidelity(time: float) -> None:
+
+    # # log(error) = m*log(delay)+c
+    # m = (np.log(0.008)-np.log(0.00001))/((np.log(1)-np.log(0.01)))
+    # c = np.log(0.00001)-m*np.log(0.01)
+    # dephasingInFidelity = np.exp(m*np.log(time)+c)
+    # # return 0.99999
+    # return 1-dephasingInFidelity
     T2 = 2.2 # Dephasing noise https://journals.aps.org/pra/pdf/10.1103/PhysRevA.99.022330
     return 1 - (1-np.exp(-time/T2))/2  # Dephasing noise https://journals.aps.org/pra/pdf/10.1103/PhysRevA.99.022330
 
