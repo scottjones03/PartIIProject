@@ -11,6 +11,6 @@ qec:
 
 # Simulation Settings
 simulation:
-  rounds: 1  # Number of rounds for error correction
-  num_shots: 1000000  # Number of shots for Monte Carlo simulations
+  rounds: 1  
+  num_shots: 1000000  
   log_file: process_log.txt  
