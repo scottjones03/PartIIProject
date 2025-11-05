@@ -83,6 +83,7 @@ def happensBeforeForOperations(
 # Function to define a happens-before relation and schedule based on operation time
 def paralleliseOperations(
     operationSequence: Sequence[Operation],
+    isWISEArch: bool = False
 ) -> Mapping[float, ParallelOperation]:
     all_components: List[QCCDComponent] = []
     for op in operationSequence:
@@ -103,6 +104,7 @@ def paralleliseOperations(
         involved_components: Set[QCCDComponent] = set()
         operations_to_start: List[Operation] = []
         
+        firstOp = None
         remaining_ops = topologically_sorted_ops[:]
         for op in remaining_ops:
             # check if the components are free at the required time
@@ -110,15 +112,18 @@ def paralleliseOperations(
             start_time_for_op = max(component_ready_time, earliest_start_times[op])
             if start_time_for_op == current_time and involved_components.isdisjoint(op.involvedComponents):
                 # If the operation can start now and its components are free
-                operations_to_start.append(op)
-                topologically_sorted_ops.remove(op)
-                earliest_start_times.pop(op)
-                operation_end_times[op] = current_time + op.operationTime()
-                # Update when the components will be busy until
-                for component in op.involvedComponents:
-                    component_busy_until[component] = operation_end_times[op]
-                for next_op in happens_before[op]:
-                    earliest_start_times[next_op] = max(operation_end_times[op], earliest_start_times[next_op])
+                if firstOp is None:
+                    firstOp  = op 
+                if not isWISEArch or (isWISEArch and isinstance(op, type(firstOp))):
+                    operations_to_start.append(op)
+                    topologically_sorted_ops.remove(op)
+                    earliest_start_times.pop(op)
+                    operation_end_times[op] = current_time + op.operationTime()
+                    # Update when the components will be busy until
+                    for component in op.involvedComponents:
+                        component_busy_until[component] = operation_end_times[op]
+                    for next_op in happens_before[op]:
+                        earliest_start_times[next_op] = max(operation_end_times[op], earliest_start_times[next_op])
             involved_components.update(op.involvedComponents)
         if operations_to_start:
             # Assign the parallel operations to the current time slot
@@ -133,20 +138,22 @@ def paralleliseOperations(
 
 def paralleliseOperationsWithBarriers(
     operationSequence: Sequence[Operation],
-    barriers: List[int]
+    barriers: List[int],
+    isWiseArch: bool = False
 ) -> Mapping[float, ParallelOperation]:
     time_schedule = {}
     barriers.insert(0, 0)
     barriers.append(len(operationSequence))
     t=0.0
     for start, barrier in zip(barriers[:-1], barriers[1:]):
-        for s, os in paralleliseOperations(operationSequence[start: barrier]).items():
+        for s, os in paralleliseOperations(operationSequence[start: barrier], isWISEArch=isWiseArch).items():
             time_schedule[s+t] = os 
         t = max(x+max(y.operationTime() for y in ys.operations) for x, ys in time_schedule.items())
     return time_schedule
 
 def calculateDephasingFromIdling(
-    operationSequence: Sequence[Operation]
+    operationSequence: Sequence[Operation],
+    isWISEArch: bool = False
 ) -> Mapping[Ion, Sequence[Tuple[Operation, float]]]:
     all_components: List[QCCDComponent] = []
     for op in operationSequence:
@@ -166,8 +173,11 @@ def calculateDephasingFromIdling(
     ion_idling_operations: Dict[Ion, List[QubitOperation]] = {ion: [] for ion in all_ions}
     idling_ions: List[Ion] = all_ions.copy()
 
+    
     while True:
         involved_components: Set[QCCDComponent] = set()
+        
+        firstOp = None
         
         remaining_ops = topologically_sorted_ops[:]
         for op in remaining_ops:
@@ -176,26 +186,29 @@ def calculateDephasingFromIdling(
             start_time_for_op = max(component_ready_time, earliest_start_times[op])
             if start_time_for_op == current_time and involved_components.isdisjoint(op.involvedComponents):
                 # If the operation can start now and its components are free
-                topologically_sorted_ops.remove(op)
-                earliest_start_times.pop(op)
-                operation_end_times[op] = current_time + op.operationTime()
-                # Pauli Z errors on ALL qubits during any crystal-reconfiguration operation, and on idle qubits not involved in an entangling gate 
-                # so define idling qubits to be those not involved in a QubitOperation
-                if isinstance(op, QubitOperation):
-                    for ion in op.ions:
-                        if ion in idling_ions:
-                            idling_ions.remove(ion)
-                            idling_start_time = ion_idling_times[ion][-1][0]
-                            if current_time-idling_start_time>0:
-                                ion_idling_times[ion][-1]=(idling_start_time, current_time-idling_start_time)
-                                ion_idling_operations[ion].append(op)
-                            else:
-                                ion_idling_times[ion] = ion_idling_times[ion][:-1]
-                # Update when the components will be busy until
-                for component in op.involvedComponents:
-                    component_busy_until[component] = operation_end_times[op]
-                for next_op in happens_before[op]:
-                    earliest_start_times[next_op] = max(operation_end_times[op], earliest_start_times[next_op])
+                if firstOp is None:
+                    firstOp  = op 
+                if not isWISEArch or (isWISEArch and isinstance(op, type(firstOp))):
+                    topologically_sorted_ops.remove(op)
+                    earliest_start_times.pop(op)
+                    operation_end_times[op] = current_time + op.operationTime()
+                    # Pauli Z errors on ALL qubits during any crystal-reconfiguration operation, and on idle qubits not involved in an entangling gate 
+                    # so define idling qubits to be those not involved in a QubitOperation
+                    if isinstance(op, QubitOperation):
+                        for ion in op.ions:
+                            if ion in idling_ions:
+                                idling_ions.remove(ion)
+                                idling_start_time = ion_idling_times[ion][-1][0]
+                                if current_time-idling_start_time>0:
+                                    ion_idling_times[ion][-1]=(idling_start_time, current_time-idling_start_time)
+                                    ion_idling_operations[ion].append(op)
+                                else:
+                                    ion_idling_times[ion] = ion_idling_times[ion][:-1]
+                    # Update when the components will be busy until
+                    for component in op.involvedComponents:
+                        component_busy_until[component] = operation_end_times[op]
+                    for next_op in happens_before[op]:
+                        earliest_start_times[next_op] = max(operation_end_times[op], earliest_start_times[next_op])
             involved_components.update(op.involvedComponents)
         # Move to the next available time (based on the minimum operation time)
         next_time_steps = [t for t in component_busy_until.values() if t>current_time]

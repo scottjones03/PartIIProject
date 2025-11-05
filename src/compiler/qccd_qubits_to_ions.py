@@ -48,7 +48,7 @@ def _partitionClusterIons(
         clusters.append((clusterIons, clusterCentre))
     return clusters
 
-def regularPartition(measurementIons: Sequence[Ion], dataIons: Sequence[Ion], trapCapacity: int):
+def regularPartition(measurementIons: Sequence[Ion], dataIons: Sequence[Ion], trapCapacity: int, isWISEArch: bool =False):
         dIonsPerTrap = trapCapacity 
         while True:
             measurementIonsL = list(measurementIons)
@@ -65,11 +65,11 @@ def regularPartition(measurementIons: Sequence[Ion], dataIons: Sequence[Ion], tr
                 clusters.append((cIons, clusterM[1]*(1-rD)+cl[1]*rD))
                 clusters.remove(cl)
             maxClusterSize = max([len(c[0]) for c in clusters])
-            if maxClusterSize > trapCapacity-1:
+            if maxClusterSize > trapCapacity-(0 if isWISEArch else 1):
                 if dIonsPerTrap == 2:
                     ions = list(measurementIons)+list(dataIons)
                     ionCoords = np.array([list(ion.pos) for ion in ions])
-                    clusters=_partitionClusterIons(ions, ionCoords, trapCapacity-1)
+                    clusters=_partitionClusterIons(ions, ionCoords, trapCapacity-(0 if isWISEArch else 1))
                     return clusters 
                 dIonsPerTrap -= 1
             else:

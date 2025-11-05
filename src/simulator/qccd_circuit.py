@@ -19,9 +19,15 @@ from src.compiler.qccd_parallelisation import *
 from src.compiler.qccd_qubits_to_ions import *
 from src.compiler.qccd_ion_routing import *
 from src.compiler.qccd_WISE_ion_route import *
+from src.Moveless_QCCDSimWork.machine import Machine, machine_graph_to_labeled_coordinates
+from src.Moveless_QCCDSimWork.parse import InputParse
+from src.Moveless_QCCDSimWork.mappers import QubitMapGreedy
+from src.Moveless_QCCDSimWork import customScheduler
+from src.Moveless_QCCDSimWork.analyzer import *
 import logging
 from multiprocessing import get_logger
 
+OPEN_QASM_VERSION = 2
 class QCCDCircuit(stim.Circuit):
     DATA_QUBIT_COLOR = "lightblue"
     MEASUREMENT_QUBIT_COLOR = "red"
@@ -172,7 +178,7 @@ class QCCDCircuit(stim.Circuit):
                 ion.addMotionalEnergy(-ion.motionalMode)
         return self._arch
     
-    def simulate(self, operations: Sequence[Operation], num_shots: int = 100_000, error_scaling: float = 1.0, decode: bool = True) -> Tuple[float, float, float]:
+    def simulate(self, operations: Sequence[Operation], num_shots: int = 100_000, error_scaling: float = 1.0, decode: bool = True, isWISEArch: bool =True) -> Tuple[float, float, float]:
         # TODO add the effect of dephasing noise from idling qubits involved in splits and merges into this simulation (see notability notes)
         # TODO add importance subset sampling (see notability notes)
         # TODO speed up with sinter (see stim/getting_started)
@@ -206,7 +212,7 @@ class QCCDCircuit(stim.Circuit):
 
         meanPhysicalZError = 0.0
         meanPhysicalXError = 0.0
-        dephasingSchedule  = calculateDephasingFromIdling(operations)
+        dephasingSchedule  = calculateDephasingFromIdling(operations, isWISEArch)
         dephasingSchedule = dict(dephasingSchedule)
 
         numZGates = 0
@@ -309,6 +315,75 @@ class QCCDCircuit(stim.Circuit):
                 num_errors += 1
         logicalError = num_errors / num_shots 
         return logicalError, meanPhysicalXError, meanPhysicalZError
+
+
+
+    def processCircuitWithQCCDSimMachine(
+            self,
+            machine: Machine,
+            dataQubitIdxs: Optional[Sequence[int]]=None,
+    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]: 
+        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+        if machine.num_ions < len(self._ionMapping):
+            raise ValueError("processCircuit: not enough traps")
+        
+        qasmCircuit = self.without_noise().to_qasm(open_qasm_version=OPEN_QASM_VERSION, skip_dets_and_obs=True)
+        trapCapacity = 0
+        #Parse the input program DAG
+        ip = InputParse()
+        ip.parse_from_string(qasmCircuit)
+
+        # qm = QubitMapGreedy(ip, machine)
+        # mapping = qm.compute_mapping()  
+        
+        mapping = customScheduler.get_custom_mapping(qasmCircuit, machine, "", len(self._measurementIons), len(self._ionMapping))
+
+        labelled_coords = machine_graph_to_labeled_coordinates(machine)
+
+        self._arch = QCCDArch()
+        
+        coordsToNd = {}
+        nToNd = {}
+        for (l, n, cx, cy) in labelled_coords:
+            if l=='T':
+                trapCapacity = n.capacity
+                nd = self._arch.addManipulationTrap(
+                    *self._gridToCoordinate((cx, cy), trapCapacity), [self._ionMapping[idx][0] for idx in mapping[n.id]], isHorizontal=False, capacity=n.capacity,  color=self.TRAP_COLOR,
+                )
+            else:
+                nd = self._arch.addJunction(
+                    *self._gridToCoordinate((cx, cy), trapCapacity)
+                )
+            coordsToNd[(cx, cy)] = nd, l
+            nToNd[n] = nd
+        # minX, maxX = min(lc[2] for lc in labelled_coords), max(lc[2] for lc in labelled_coords)
+        # minY, maxY = min(lc[3] for lc in labelled_coords), max(lc[3] for lc in labelled_coords)
+        # for x in range(minX, maxX+1, 1):
+        #     for y in range(minY, maxY+1, 1):
+        #         if (x,y) in coordsToNd:
+        #             nd1, l1 = coordsToNd[(x,y)]
+        #             if (x+1, y) in coordsToNd:
+        #                 nd2, l2 = coordsToNd[(x+1,y)]
+        #                 if l1 == 'J' or l2 == 'J':   
+        #                     self._arch.addEdge(nd1, nd2)
+        #             if (x, y+1) in coordsToNd:
+        #                 nd2, l2 = coordsToNd[(x, y+1)]
+        #                 if l1 == 'J' or l2 == 'J':   
+        #                     self._arch.addEdge(nd1, nd2)
+
+        for edge in machine.graph.edges:
+            n1, n2 = edge[0], edge[1]
+            self._arch.addEdge(nToNd[n1], nToNd[n2])
+
+        
+
+        trap_ions = {}
+        for i in machine.traps:
+            if mapping[i.id]:
+                trap_ions[i.id] = mapping[i.id][:]
+
+        return self._arch, (instructions, barriers)
+
 
     def processCircuitAugmentedGrid(
         self,
@@ -429,34 +504,93 @@ class QCCDCircuit(stim.Circuit):
         dataQubitIdxs: Optional[Sequence[int]]=None,
     ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
         instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
-        if wiseArch.m*wiseArch.n < len(self._ionMapping):
+        if wiseArch.m*wiseArch.n*wiseArch.k < len(self._ionMapping):
             raise ValueError("processCircuit: not enough traps")
            
-        clusters=[]
-        cluster = []
-        for ion in (self._measurementIons)+(self._dataIons):
-            if len(cluster)==wiseArch.k:
-                clusters.append(cluster)
-                cluster=[]
-            cluster.append(ion)
+        
+        clusters=regularPartition(self._measurementIons, self._dataIons, wiseArch.k, isWISEArch=True)
 
-        clusters.append(cluster)
-        cluster=[]
- 
+        cs, rs = wiseArch.m, wiseArch.n
+        allGridPos = []
+        for r in range(rs):
+            for c in range(cs):
+                allGridPos.append((c, r))
+        gridPositions = hillClimbOnArrangeClusters(clusters, allGridPos=allGridPos)
+        gridPositions = [(c, r) for (c, r) in gridPositions]
+        rows = wiseArch.n
+        cols = wiseArch.m
+        trap_for_grid = {
+            (2*col, row): clusters[trapIdx]
+            for trapIdx, (col, row) in enumerate(gridPositions)
+        }
         self._originalArrangement = {}
+
 
         self._arch = QCCDArch()
         traps_dict = {}
-        for idx, ions in enumerate(clusters):
-            traps_dict[(0, idx)] = self._arch.addManipulationTrap(
-                *self._gridToCoordinate((0, idx), wiseArch.k),
-                ions,
-                color=self.TRAP_COLOR,
-                isHorizontal=True,
-                capacity=wiseArch.k
-            )
-            self._originalArrangement[traps_dict[(0, idx)]] = ions
+        for row in range(rows):
+            for col in range(cols):
+                if (2*col, row) in trap_for_grid:
+                    ions = trap_for_grid[(2*col, row)][0]
+                else:
+                    ions = []
+                maxIdx=max(self._ionMapping.keys())
+                nplaceholds = wiseArch.k-len(ions)
+                for i in range(nplaceholds):
+                    ion = QubitIon(*self.PLACEMENT_ION)
+                    idx = maxIdx+1+i
+                    ion.set(idx, *ion.pos)
+                    self._ionMapping[idx] = ion
+                    ions.append(ion)
+                traps_dict[(2*col, row)] = self._arch.addManipulationTrap(
+                    *self._gridToCoordinate((2*col, row), wiseArch.k),
+                    ions,
+                    color=self.TRAP_COLOR,
+                    isHorizontal=True,
+                    capacity=wiseArch.k
+                )
+                self._originalArrangement[traps_dict[(2*col, row)]] = ions
+            
+        if rows == 1:
+            for (col, r), trap_node in traps_dict.items():
+                if (col + 2, r) in traps_dict:
+                    self._arch.addEdge(trap_node, traps_dict[(col + 2, r)])
+        else:
+            junctions_dict = {}
+            for (col, row), trap_node in traps_dict.items():
+                if (col, row + 1) in traps_dict:
+                    junctionTop = self._arch.addJunction(
+                        *self._gridToCoordinate((col+1, row), wiseArch.k),
+                        color=self.JUNCTION_COLOR,
+                    )
+                    junctionBottom = self._arch.addJunction(
+                        *self._gridToCoordinate((col+1, row+1), wiseArch.k),
+                        color=self.JUNCTION_COLOR,
+                    )
+                    junctions_dict[(col+1, row)] = junctionTop
+                    junctions_dict[(col+1, row+1)] = junctionBottom
+                    self._arch.addEdge(junctionTop, junctionBottom)
+                
+            # Add horizontal edges between traps and junctions in the same row
+            for row in range(rows):
+                for col in range(cols):
+                    if (2*col+1, row) in junctions_dict and (
+                        2*col,
+                        row,
+                    ) in traps_dict:
+                        self._arch.addEdge(
+                            junctions_dict[(2*col+1, row)], traps_dict[(2*col, row)]
+                        )
+                    if (2*col+2, row) in traps_dict and (
+                        2*col + 1,
+                        row,
+                    ) in junctions_dict:
+                        self._arch.addEdge(
+                            traps_dict[(2*col+2, row)], junctions_dict[(2*col + 1, row)]
+                        )
 
+        if any(i.parent is None for i in self._arch.ions.values()):
+            raise ValueError(f"Ions not in traps for {wiseArch.k} and {len(self._measurementIons)+len(self._dataIons)}")
         return self._arch, (instructions, barriers)
     
 
