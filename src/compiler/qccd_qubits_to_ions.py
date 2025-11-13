@@ -5,6 +5,7 @@ from scipy.optimize import linear_sum_assignment
 from typing import (
     Sequence,
     Tuple,
+    Optional
 )
 import itertools
 from src.utils.qccd_nodes import *
@@ -15,9 +16,76 @@ from src.compiler.qccd_parallelisation import *
 
 MAX_ITER = 20_000
         
+
+
+def _merge_clusters_to_limit(
+    clusters: Sequence[Tuple[Sequence["Ion"], npt.NDArray[np.float64]]],
+    max_clusters: int,
+    capacity: int,
+) -> Sequence[Tuple[Sequence["Ion"], npt.NDArray[np.float64]]]:
+    """
+    Greedily merge clusters until len(clusters) <= max_clusters, while
+    never exceeding 'capacity' ions per cluster.
+
+    Each cluster is (ions, centre) where:
+      - ions   : Sequence[Ion]
+      - centre : np.array([x, y])
+
+    Merging strategy:
+      - repeatedly pick the closest pair of cluster centres whose combined
+        size <= capacity, merge them, and update the centre as a weighted mean.
+      - if no such pair exists but we still have too many clusters, raise.
+    """
+    clusters = [(list(ions), np.array(centre, dtype=float)) for ions, centre in clusters]
+
+    while len(clusters) > max_clusters:
+        best_pair = None
+        best_dist2 = None
+
+        # Find best pair to merge (closest centres, respecting capacity)
+        for i in range(len(clusters)):
+            ions_i, centre_i = clusters[i]
+            size_i = len(ions_i)
+            for j in range(i + 1, len(clusters)):
+                ions_j, centre_j = clusters[j]
+                size_j = len(ions_j)
+                if size_i + size_j > capacity:
+                    continue
+                d2 = float(np.sum((centre_i - centre_j) ** 2))
+                if best_pair is None or d2 < best_dist2:
+                    best_pair = (i, j)
+                    best_dist2 = d2
+
+        if best_pair is None:
+            # We cannot reduce the number of clusters further without
+            # violating the per-trap capacity; this is a genuine
+            # impossibility (either architecture underprovisioned or
+            # constraints inconsistent).
+            raise RuntimeError(
+                f"Cannot reduce clusters to max_clusters={max_clusters} "
+                f"without exceeding capacity={capacity}. "
+                f"Current #clusters={len(clusters)}."
+            )
+
+        i, j = best_pair
+        ions_i, centre_i = clusters[i]
+        ions_j, centre_j = clusters[j]
+
+        merged_ions = ions_i + ions_j
+        total_size = len(merged_ions)
+        # weighted average of centres by ion count
+        merged_centre = (centre_i * len(ions_i) + centre_j * len(ions_j)) / total_size
+
+        # Remove old clusters (careful with indices) and append merged one
+        for idx in sorted((i, j), reverse=True):
+            clusters.pop(idx)
+        clusters.append((merged_ions, merged_centre))
+
+    return clusters
+
 def _partitionClusterIons(
-    ions: Sequence[Ion], coords: npt.NDArray[np.float_], trapCapacity: int
-) -> Sequence[Tuple[Sequence[Ion], npt.NDArray[np.float_]]]:
+    ions: Sequence[Ion], coords: npt.NDArray[np.float64], trapCapacity: int
+) -> Sequence[Tuple[Sequence[Ion], npt.NDArray[np.float64]]]:
     partitions = [list(coords)]
     splitAxisIsX = True
     while max([len(p) for p in partitions])>trapCapacity:
@@ -48,34 +116,82 @@ def _partitionClusterIons(
         clusters.append((clusterIons, clusterCentre))
     return clusters
 
-def regularPartition(measurementIons: Sequence[Ion], dataIons: Sequence[Ion], trapCapacity: int, isWISEArch: bool =False):
-        dIonsPerTrap = trapCapacity 
-        while True:
-            measurementIonsL = list(measurementIons)
-            measurementIonCoords = np.array([list(ion.pos) for ion in measurementIonsL])
-            dataIonsL = list(dataIons)
-            dataIonCoords = np.array([list(ion.pos) for ion in dataIonsL])
-            clustersD=list(_partitionClusterIons(dataIonsL, dataIonCoords, dIonsPerTrap)) 
-            clustersM=list(_partitionClusterIons(measurementIonsL, measurementIonCoords, 1)) 
-            clusters = list(clustersD)
-            for clusterM in clustersM:
-                cl = min(clusters, key=lambda c: (c[1][0]-clusterM[1][0])**2+(c[1][1]-clusterM[1][1])**2)
-                cIons = list(cl[0])+list(clusterM[0])
-                rD = len(cl[0])/len(cIons)
-                clusters.append((cIons, clusterM[1]*(1-rD)+cl[1]*rD))
-                clusters.remove(cl)
-            maxClusterSize = max([len(c[0]) for c in clusters])
-            if maxClusterSize > trapCapacity-(0 if isWISEArch else 1):
-                if dIonsPerTrap == 2:
-                    ions = list(measurementIons)+list(dataIons)
-                    ionCoords = np.array([list(ion.pos) for ion in ions])
-                    clusters=_partitionClusterIons(ions, ionCoords, trapCapacity-(0 if isWISEArch else 1))
-                    return clusters 
-                dIonsPerTrap -= 1
-            else:
-                return clusters
 
+def regularPartition(
+    measurementIons: Sequence["Ion"],
+    dataIons: Sequence["Ion"],
+    trapCapacity: int,
+    *,
+    isWISEArch: bool = False,
+    maxClusters: Optional[int] = None,
+) -> Sequence[Tuple[Sequence["Ion"], npt.NDArray[np.float64]]]:
+    """
+    Partition measurement and data ions into clusters, each cluster fitting
+    within a trap of capacity 'trapCapacity' (or trapCapacity-1 if not WISE),
+    and (optionally) ensure that the total number of clusters does not exceed
+    maxClusters by merging nearby clusters.
 
+    Behaviour without maxClusters is unchanged from your original version.
+    """
+    # Effective per-cluster capacity in final layout
+    eff_capacity = trapCapacity - (0 if isWISEArch else 1)
+
+    dIonsPerTrap = trapCapacity
+    while True:
+        measurementIonsL = list(measurementIons)
+        measurementIonCoords = np.array([list(ion.pos) for ion in measurementIonsL])
+
+        dataIonsL = list(dataIons)
+        dataIonCoords = np.array([list(ion.pos) for ion in dataIonsL])
+
+        # First, partition data ions into dIonsPerTrap-sized clusters
+        clustersD = list(_partitionClusterIons(dataIonsL, dataIonCoords, dIonsPerTrap))
+
+        # Measurement ions are clustered one per cluster initially
+        clustersM = list(_partitionClusterIons(measurementIonsL, measurementIonCoords, 1))
+
+        # Start from data clusters
+        clusters = list(clustersD)
+
+        # Then attach each measurement-cluster to the nearest data-cluster
+        # (this is your original semantics).
+        for clusterM in clustersM:
+            # Find nearest existing cluster by centre
+            cl = min(
+                clusters,
+                key=lambda c: (c[1][0] - clusterM[1][0]) ** 2
+                              + (c[1][1] - clusterM[1][1]) ** 2
+            )
+            cIons = list(cl[0]) + list(clusterM[0])
+            rD = len(cl[0]) / len(cIons)
+            newCentre = clusterM[1] * (1 - rD) + cl[1] * rD
+            clusters.append((cIons, newCentre))
+            clusters.remove(cl)
+
+        maxClusterSize = max(len(c[0]) for c in clusters)
+
+        if maxClusterSize > eff_capacity:
+            # Need to reduce data ions per trap and try again
+            if dIonsPerTrap == 2:
+                # Fallback: cluster all ions together directly with eff_capacity
+                ions = list(measurementIons) + list(dataIons)
+                ionCoords = np.array([list(ion.pos) for ion in ions])
+                clusters = _partitionClusterIons(ions, ionCoords, eff_capacity)
+                break
+            dIonsPerTrap -= 1
+        else:
+            # Capacity constraint satisfied
+            break
+
+    # NEW: enforce maximum number of clusters (traps) if requested
+    if maxClusters is not None and len(clusters) > maxClusters:
+        clusters = _merge_clusters_to_limit(
+            clusters,
+            max_clusters=maxClusters,
+            capacity=eff_capacity,
+        )
+
+    return clusters
 
 def _minWeightPerfectMatch(A, BSubset, centralizerMatrix, dividerMatrix, nearestCoordsA, nearestDistsA) -> Tuple[float, Sequence[int]]:
     RelBSubset = np.divide((BSubset-centralizerMatrix), dividerMatrix)

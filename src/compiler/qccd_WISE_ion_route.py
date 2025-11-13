@@ -23,6 +23,7 @@ def _grow_slice_and_route(
     wiseArch: QCCDWiseArch,
     P_arr: List[List[Tuple[int, int]]],
     subgridsize: Tuple[int, int, int],
+    active_ions: List[int] = None
 ) -> List[np.ndarray]:
     """
     Internal helper: given a global arrangement (oldArrangementArr) and a small
@@ -68,6 +69,7 @@ def _grow_slice_and_route(
         currentGridList: List[List[int]] = []
         max_row = min(endrow, wiseArch.n)
         max_col = min(endcol, wiseArch.m * wiseArch.k)
+        isGridFull = 1-max_row/wiseArch.n ,1-( max_col/(wiseArch.m*wiseArch.k))
 
         for r in range(max_row):
             if len(currentGridList) == r:
@@ -104,6 +106,9 @@ def _grow_slice_and_route(
             }
             BT_in_grid.append(bt_slice)
 
+        
+
+   
         # 4) Solve this slice:
         #    Level-2 and Level-3 happen inside _optimal_QMR_for_WISE:
         #      - Level-2: SAT + D-minimisation,
@@ -113,6 +118,9 @@ def _grow_slice_and_route(
             P_arr_in_grid,
             k=wiseArch.k,
             BT=BT_in_grid,
+            active_ions=active_ions,
+            wB_col=isGridFull[1],
+            wB_row=isGridFull[0]
         )
 
         # 5) Update boundary_targets and decide which pairs to drop
@@ -150,13 +158,13 @@ def _grow_slice_and_route(
         P_arr = new_P_arr
 
         # 7) Termination: slice has fully covered the device
-        if (endrow > wiseArch.n) and (endcol > wiseArch.m * wiseArch.k):
+        if (endrow >= wiseArch.n) and (endcol >= wiseArch.m * wiseArch.k):
             break
 
         # 8) Grow the slice (zig-zag: first columns, then rows, ...)
         if incrow:
             endrow += step
-            incrow = endcol > wiseArch.m * wiseArch.k
+            incrow = endcol >= wiseArch.m * wiseArch.k
         else:
             endcol += step
             incrow = endrow <= wiseArch.n
@@ -371,12 +379,14 @@ def ionRoutingWISEArch(
         c = i % (wiseArch.m * wiseArch.k)
         oldArrangementArr[r][c] = ion.idx
 
+    active_ions = [ion.idx for ion in ionsSorted if not isinstance(ion, SpectatorIon)]
+
     # ------------------------------------------------------------------
     # 3) Initial global reconfiguration via Level-1/2/3 on the first chunk
     # ------------------------------------------------------------------
     P_arr = parallelPairs[: min(len(parallelPairs), lookahead)].copy()
     layouts_after = _grow_slice_and_route(
-        oldArrangementArr, wiseArch, P_arr, subgridsize
+        oldArrangementArr, wiseArch, P_arr, subgridsize, active_ions=active_ions
     )
     oldArrangementArr = _apply_layout_as_reconfiguration(
         arch, wiseArch, oldArrangementArr, newArrangementArr, layouts_after, allOps
@@ -430,7 +440,7 @@ def ionRoutingWISEArch(
         # 4c) Between MS rounds: re-route using next lookahead window of pairs
         P_arr = parallelPairs[idx : min(len(parallelPairs), lookahead + idx)].copy()
         layouts_after = _grow_slice_and_route(
-            oldArrangementArr, wiseArch, P_arr, subgridsize
+            oldArrangementArr, wiseArch, P_arr, subgridsize, active_ions=active_ions
         )
         oldArrangementArr = _apply_layout_as_reconfiguration(
             arch, wiseArch, oldArrangementArr, newArrangementArr, layouts_after, allOps

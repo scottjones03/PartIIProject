@@ -109,6 +109,8 @@ class QubitIon(Ion):
     def allowedOperations(self) -> Sequence[Operations]:
         return super().allowedOperations+[Operations.MEASUREMENT, Operations.ONE_QUBIT_GATE, Operations.TWO_QUBIT_MS_GATE, Operations.QUBIT_RESET]
 
+class SpectatorIon(QubitIon):
+    ...
 
 
 class QCCDNode(QCCDComponent):

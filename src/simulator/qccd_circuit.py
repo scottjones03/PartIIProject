@@ -158,7 +158,7 @@ class QCCDCircuit(stim.Circuit):
 
     def _gridToCoordinate(
         self, pos: Tuple[int, int], trapCapacity: int
-    ) -> npt.NDArray[np.float_]:
+    ) -> npt.NDArray[np.float64]:
         return np.array(pos) * (trapCapacity + 1) * self.SPACING
 
     def resetArch(
@@ -187,6 +187,8 @@ class QCCDCircuit(stim.Circuit):
         stimIdxs: List[int] = []
         ions: List[Ion] = []
         for stimIdx, (ion, _) in self._ionMapping.items():
+            if isinstance(ion, SpectatorIon):
+                continue
             stimIdxs.append(stimIdx)
             ions.append(ion)
 
@@ -502,13 +504,17 @@ class QCCDCircuit(stim.Circuit):
         self,
         wiseArch: QCCDWiseArch,
         dataQubitIdxs: Optional[Sequence[int]]=None,
+        addSpectators: bool = True,
+        compactClustering: bool = True
     ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
         instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
-        if wiseArch.m*wiseArch.n*wiseArch.k < len(self._ionMapping):
+        if compactClustering and wiseArch.m*wiseArch.n*wiseArch.k < len(self._ionMapping):
             raise ValueError("processCircuit: not enough traps")
+        # if not compactClustering and (wiseArch.k-1) * ((rows-1) * (cols-1)+cols) < len(self._ionMapping):
+        #     raise ValueError("processCircuit: not enough traps")
            
         
-        clusters=regularPartition(self._measurementIons, self._dataIons, wiseArch.k, isWISEArch=True)
+        clusters=regularPartition(self._measurementIons, self._dataIons, wiseArch.k, isWISEArch=( compactClustering), maxClusters=wiseArch.m*wiseArch.n if compactClustering else None)
 
         cs, rs = wiseArch.m, wiseArch.n
         allGridPos = []
@@ -534,14 +540,15 @@ class QCCDCircuit(stim.Circuit):
                     ions = trap_for_grid[(2*col, row)][0]
                 else:
                     ions = []
-                maxIdx=max(self._ionMapping.keys())
-                nplaceholds = wiseArch.k-len(ions)
-                for i in range(nplaceholds):
-                    ion = QubitIon(*self.PLACEMENT_ION)
-                    idx = maxIdx+1+i
-                    ion.set(idx, *ion.pos)
-                    self._ionMapping[idx] = ion
-                    ions.append(ion)
+                if addSpectators:
+                    maxIdx=max(self._ionMapping.keys())
+                    nplaceholds = wiseArch.k-len(ions)
+                    for i in range(nplaceholds):
+                        ion = SpectatorIon(*self.PLACEMENT_ION)
+                        idx = maxIdx+1+i
+                        ion.set(idx, *ion.pos)
+                        self._ionMapping[idx] = ion, ion.pos
+                        ions.append(ion)
                 traps_dict[(2*col, row)] = self._arch.addManipulationTrap(
                     *self._gridToCoordinate((2*col, row), wiseArch.k),
                     ions,
@@ -559,17 +566,26 @@ class QCCDCircuit(stim.Circuit):
             junctions_dict = {}
             for (col, row), trap_node in traps_dict.items():
                 if (col, row + 1) in traps_dict:
-                    junctionTop = self._arch.addJunction(
-                        *self._gridToCoordinate((col+1, row), wiseArch.k),
-                        color=self.JUNCTION_COLOR,
+                    if (col+1, row) not in junctions_dict:
+                        junctionTop = self._arch.addJunction(
+                            *self._gridToCoordinate((col+1, row), wiseArch.k),
+                            color=self.JUNCTION_COLOR,
+                        )
+                        junctions_dict[(col+1, row)] = junctionTop
+                    if (col+1, row+1) not in junctions_dict:
+                    
+                        junctionBottom = self._arch.addJunction(
+                            *self._gridToCoordinate((col+1, row+1), wiseArch.k),
+                            color=self.JUNCTION_COLOR,
+                         )
+                        
+                        junctions_dict[(col+1, row+1)] = junctionBottom
+                
+            for (col, row), junctionTop in junctions_dict.items():
+                if (col, row+1) in junctions_dict:
+                    self._arch.addEdge(
+                        junctions_dict[(col,row+1)], junctionTop
                     )
-                    junctionBottom = self._arch.addJunction(
-                        *self._gridToCoordinate((col+1, row+1), wiseArch.k),
-                        color=self.JUNCTION_COLOR,
-                    )
-                    junctions_dict[(col+1, row)] = junctionTop
-                    junctions_dict[(col+1, row+1)] = junctionBottom
-                    self._arch.addEdge(junctionTop, junctionBottom)
                 
             # Add horizontal edges between traps and junctions in the same row
             for row in range(rows):
