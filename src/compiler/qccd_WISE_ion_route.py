@@ -24,7 +24,7 @@ def _grow_slice_and_route(
     P_arr: List[List[Tuple[int, int]]],
     subgridsize: Tuple[int, int, int],
     active_ions: List[int] = None
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], List[Dict[str, Any]]]:
     """
     Internal helper: given a global arrangement (oldArrangementArr) and a small
     list of parallel ion pairs per round P_arr (length R):
@@ -63,13 +63,39 @@ def _grow_slice_and_route(
     incrow = False            # zig-zag grow: col, row, col, row, ...
 
     layouts_after: List[np.ndarray] = []
+    freeze_seed_prev=None
+
+    full_P_arr = P_arr.copy()
 
     while True:
         # 1) Build the current growing grid anchored at (0,0)
         currentGridList: List[List[int]] = []
+        # ----------------------------------------------------------------------
+        # Boundary weights as a function of subgrid fill
+        # ----------------------------------------------------------------------
         max_row = min(endrow, wiseArch.n)
         max_col = min(endcol, wiseArch.m * wiseArch.k)
-        isGridFull = 1-max_row/wiseArch.n ,1-( max_col/(wiseArch.m*wiseArch.k))
+
+        fill_row = max_row / wiseArch.n
+        fill_col = max_col / (wiseArch.m * wiseArch.k)
+
+        if max_row == wiseArch.n and max_col == wiseArch.m * wiseArch.k:
+            # Full grid: disable boundary soft clauses.
+            wB_row = 0
+            wB_col = 0
+        else:
+            # Partial grid: moderate, non-explosive weights.
+            # As subgrid grows, weights shrink but never go to zero.
+            base = 6.0
+            shrink = 3.0
+            wB_row = int(max(1.0, base - shrink * fill_row))
+            wB_col = int(max(1.0, base - shrink * fill_col))
+
+        print(
+            f"INFO: boundary weights for subgrid {max_row}×{max_col} "
+            f"in full grid {wiseArch.n}×{wiseArch.m * wiseArch.k}: "
+            f"wB_row={wB_row}, wB_col={wB_col}"
+        )
 
         for r in range(max_row):
             if len(currentGridList) == r:
@@ -113,14 +139,16 @@ def _grow_slice_and_route(
         #    Level-2 and Level-3 happen inside _optimal_QMR_for_WISE:
         #      - Level-2: SAT + D-minimisation,
         #      - Level-3: small MaxSAT to avoid boundary cells.
-        layouts_after = GlobalReconfigurations._optimal_QMR_for_WISE(
+        layouts_after, schedule, freeze_seed_prev = GlobalReconfigurations._optimal_QMR_for_WISE2(
             currentGrid,
             P_arr_in_grid,
             k=wiseArch.k,
             BT=BT_in_grid,
             active_ions=active_ions,
-            wB_col=isGridFull[1],
-            wB_row=isGridFull[0]
+            wB_col=wB_col,
+            wB_row=wB_row,
+            freeze_seed_prev=freeze_seed_prev,
+            full_P_arr=full_P_arr
         )
 
         # 5) Update boundary_targets and decide which pairs to drop
@@ -169,7 +197,7 @@ def _grow_slice_and_route(
             endcol += step
             incrow = endrow <= wiseArch.n
 
-    return layouts_after
+    return layouts_after, schedule
 
 
 def _apply_layout_as_reconfiguration(
@@ -179,6 +207,7 @@ def _apply_layout_as_reconfiguration(
     newArrangementArr: np.ndarray,
     layouts_after: List[np.ndarray],
     allOps: List[Operation],
+    schedule: List[Dict[str, Any]]
 ) -> np.ndarray:
     """
     Internal helper: take the first layout in layouts_after (round 0 layout of
@@ -209,7 +238,7 @@ def _apply_layout_as_reconfiguration(
             newArrangement[trap].append(arch.ions[ionidx])
 
     reconfig = GlobalReconfigurations.physicalOperation(
-        newArrangement, wiseArch, oldArrangementArr, newArrangementArr
+        newArrangement, wiseArch, oldArrangementArr, newArrangementArr, schedule
     )
     allOps.append(reconfig)
     reconfig.run()
@@ -385,11 +414,11 @@ def ionRoutingWISEArch(
     # 3) Initial global reconfiguration via Level-1/2/3 on the first chunk
     # ------------------------------------------------------------------
     P_arr = parallelPairs[: min(len(parallelPairs), lookahead)].copy()
-    layouts_after = _grow_slice_and_route(
+    layouts_after, schedule = _grow_slice_and_route(
         oldArrangementArr, wiseArch, P_arr, subgridsize, active_ions=active_ions
     )
     oldArrangementArr = _apply_layout_as_reconfiguration(
-        arch, wiseArch, oldArrangementArr, newArrangementArr, layouts_after, allOps
+        arch, wiseArch, oldArrangementArr, newArrangementArr, layouts_after, allOps, schedule
     )
 
     idx = 0
@@ -439,11 +468,11 @@ def ionRoutingWISEArch(
 
         # 4c) Between MS rounds: re-route using next lookahead window of pairs
         P_arr = parallelPairs[idx : min(len(parallelPairs), lookahead + idx)].copy()
-        layouts_after = _grow_slice_and_route(
+        layouts_after, schedule = _grow_slice_and_route(
             oldArrangementArr, wiseArch, P_arr, subgridsize, active_ions=active_ions
         )
         oldArrangementArr = _apply_layout_as_reconfiguration(
-            arch, wiseArch, oldArrangementArr, newArrangementArr, layouts_after, allOps
+            arch, wiseArch, oldArrangementArr, newArrangementArr, layouts_after, allOps, schedule
         )
 
     return allOps, barriers
