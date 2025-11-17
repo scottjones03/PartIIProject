@@ -578,9 +578,10 @@ class GlobalReconfigurations(Operation):
 
     @classmethod
     def physicalOperation(
-        cls, arrangement: Mapping[Trap, Sequence[Ion]], wiseArch: QCCDWiseArch, oldAssignment: Sequence[Sequence[int]], newAssignment: Sequence[Sequence[int]], schedule: List[Dict[str, Any]]
+        cls, arrangement: Mapping[Trap, Sequence[Ion]], wiseArch: QCCDWiseArch, oldAssignment: Sequence[Sequence[int]], newAssignment: Sequence[Sequence[int]], schedule: List[Dict[str, Any]], initial_placement: bool = False
     ):
-        heatingRates, reconfigTime = cls._runOddEvenReconfig(wiseArch, arrangement, oldAssignment, newAssignment, sat_schedule=schedule)
+        heatingRates, reconfigTime = cls._runOddEvenReconfig(wiseArch, arrangement, oldAssignment, newAssignment, sat_schedule=schedule, initial_placement=initial_placement)
+        reconfigTime=1e-20 if initial_placement else reconfigTime
         def run():
             for trap in arrangement.keys():
                 while trap.ions:
@@ -588,6 +589,8 @@ class GlobalReconfigurations(Operation):
             for trap, ions in arrangement.items():
                 for i, ion in enumerate(ions):
                     trap.addIon(ion, offset=i)
+                    if initial_placement: 
+                        continue
                     ion.addMotionalEnergy(heatingRates[ion.idx])
         return cls(
             run=lambda _: run(),
@@ -597,7 +600,6 @@ class GlobalReconfigurations(Operation):
 
         )
 
- 
 
     @staticmethod
     def _optimal_QMR_for_WISE(
@@ -611,769 +613,11 @@ class GlobalReconfigurations(Operation):
         wB_col: int = 1,
         wB_row: int = 1,
         max_rc2_time: float = 600.0,
-        max_sat_time = 360.0,  
-        active_ions: Set[int] = None
-
-    ) -> List[np.ndarray]:
-        """
-        Three-level optimizer for WISE where this code deals with level 2 onwards:
-
-        Inputs:
-        - Initial layout A_in : n×m array of ion indices.
-        - Circuit P_arr: list of size R, where for each round r, P_arr[r] is the list of interacting ion pairs in that round.
-        - Block size k.
-        - Boundary targets BT: list of size R; for each round r and ion i, 
-            BT[r][i] = (d, c) means “ion i must end round r in row d and column c”
-            (these come from the previous slice’s SAT run and are treated as hard pins here).
-
-        Derived sets (per round r):
-        - Res_r  = { i | i ∈ BT[r] }      reserved ions in round r (pinned by BT).
-        - Free_r = all ions \ Res_r       non-reserved ions in round r (to be routed in this slice).
-
-
-        Let:
-        - n, m be the slice / subgrid shape (rows × columns),
-        - R be the number of lookahead rounds (typically small, e.g. R=2),
-        ----------------------------------------------------------------------
-        Three-level optimization scheme
-  
-        Level 1: Spatial slicing and incremental subgrid growth
-
-        - Given a global ion layout for WISE and a sequence of two-qubit rounds, we:
-        1. Start with a small subgrid anchored at (0,0) labelled A_in and no ions pinned in BT
-        2. Partition the circuit's two-qubit gates into parallel rounds and look only at the next R rounds, where each round has at most (#traps) gates
-        2. Iteratively do the following:
-            a. Determine P_arr from two-qubit gates that live fully inside the grid across the partitioned circuit.
-            a. Run levels 2-3 to place ions within the subgrid.
-            b. Pin ions at each round that are involved in a two-qubit gate in the subgrid
-            c. Expand the subgrid by increasing its size to the right or downwards.
-            d. Remove gates from this iteration from the partitioned circuit
-
-        Level 2: Per-subgrid D-minimising SAT solver
-
-        (Obtain a per-subgrid routing that minimises the maximum displacement D across all rounds and all ions)
-        1. Define the search range:
-        - D_lo = 0
-        - D_hi = max(n−1, m−1) 
-
-        2. For a candidate D_mid in [D_lo, D_hi], build the CNF with:
-        - constraints (0)–(7) below,
-        - the movement bound set to D_bound = D_mid.
-
-        3. Call a SAT solver on this CNF:
-        - If SAT, record D_mid and its model as a candidate solution,
-            and tighten the upper bound: D_hi = D_mid − 1.
-        - If UNSAT, increase the lower bound: D_lo = D_mid + 1.
-
-        4. At the end of binary search, let D* be the smallest D_mid for which the CNF was SAT.
-        If none exists in [0, max(n−1, m−1)], declare UNSAT for the slice.
-
-        Level 3: Boundary-aware MaxSAT at D*
-
-        1. Rebuild the formula at D_bound = D* as a weighted CNF, using the same hard constraints.
-        2. Add the boundary-avoidance clauses (8) as soft clauses, with weights w_B_col, w_B_row.
-        3. Run RC2 on this WCNF to minimize the number (and weighted importance) of soft clause violations.
-
-        Because D* is fixed, this second level only nudges the solution among all layouts that achieve D*,
-        preferring those that keep interacting ions away from the outer boundary.
-        ----------------------------------------------------------------------
-        Variables (for this slice):
-        - a[r, k, j, i]  ion i occupies cell (row k, col j) in layout at round r
-                        where r ∈ {0,…,R} (a[0] is A_in, a[1]…a[R] are layouts after each round)
-        - x[r, i, c]     in round r, ion i has target column c
-        - t[r, i, d]     in round r, ion i has target row d
-        - w[r, i, b]     in round r, ion i is in horizontal block b = 0,…,⌈m/k⌉−1
-        - p[r, k, i]     in layout a[r], ion i is present in row k
-        - y[r, k, c, i]  in round r, ion i is in row k and targets column c
-
-        Hard constraints:
-
-        For a given distance bound D ≥ 0, we build a structural CNF encoding the following:
-
-        (0) Exactly one ion per cell in each layout:
-        - For all r ∈ {0,…,R}, for all k ∈ {0,…,n−1}, for all j ∈ {0,…,m−1}:
-            ∑_i a[r, k, j, i] = 1
-
-        (1) Initial layout:
-        - For all k, j:
-            a[0, k, j, A_in[k, j]]
-
-        (2) BT pins and x/t one-hots:
-        - For each round r and ion i:
-
-        • If i ∈ Res_r with BT[r][i] = (d_fix, c_fix):
-            - x[r, i, c_fix]
-            - t[r, i, d_fix]
-            - w[r, i, floor(c_fix / k)]
-            - a[r+1, d_fix, c_fix, i]
-            (the layout after round r has ion i fixed at its pinned cell)
-
-        • If i ∉ Res_r (free ion in this slice):
-            - ∑_c x[r, i, c] = 1     (ion chooses exactly one destination column)
-            - ∑_d t[r, i, d] = 1     (ion chooses exactly one destination row)
-
-        (3) Block membership (for free ions):
-        - For all r, all i ∉ Res_r, all blocks b:
-            let block b be columns c ∈ {b·k,…,min((b+1)·k−1, m−1)}.
-            w[r, i, b] ↔ (∨_{c in block b} x[r, i, c])
-
-        (4) Pair constraints (same destination row and same block):
-        - For all r, for all (i1, i2) ∈ P_arr[r]:
-            for all destination rows d:
-                t[r, i1, d] ↔ t[r, i2, d]
-            for all blocks b:
-                w[r, i1, b] ↔ w[r, i2, b]
-            (This ensures ions in a 2-qubit gate are in the same trap)
-
-        (5) Rounds glued together (layout consistency across rounds):
-        - For all r ∈ {0,…,R−1}, for all ions i, all rows d, all columns c:
-            a[r+1, d, c, i] ↔ ( x[r, i, c] ∧ t[r, i, d] )
-            (This ensures that the layout after round r is exactly the permutation given by x[r,·,·] and t[r,·,·].)
-
-        (6) Row presence and y linkage (reserved vs free semantics):
-
-        (6a) Row presence p:
-        - For all r, k, i:
-            p[r, k, i] ↔ (∨_j a[r, k, j, i])
-            (ion i is “present in row k” at round r iff it actually occupies some cell in that row)
-
-        (6b) One-per (r, k, c) and y‐link:
-
-        - For all r, k, c:
-            ∑_i y[r, k, c, i] ≤ 1
-            (at most one ion from row k targets column c in round r)
-
-        - For all r, k, c, i:
-            if i ∉ Res_r (free ion):
-                y[r, k, c, i] ↔ (x[r, i, c] ∧ p[r, k, i])
-            if i ∈ Res_r with BT[r][i] = (d_fix, c_fix):
-                - if c = c_fix:
-                    y[r, k, c_fix, i] ↔ p[r, k, i]
-                - if c ≠ c_fix:
-                    y[r, k, c, i] = False
-            (helper variable y is linked to variables x and p consistently)
-
-        (Consequences of (6): no two ions from the same current row can target the same column, which makes reconfiguration by WISE control hardware easy.)
-
-        (7) Movement bound with respect to D:
-        - For each round r, for each ion i, for each source cell (k, j) where a[r, k, j, i] holds:
-
-        Horizontal bound:
-        - For all columns c with |c − j| > D:
-            a[r, k, j, i] → ¬x[r, i, c]
-            (ion i cannot choose a target column c more than D steps away from its current column j.)
-
-        Vertical bound:
-        - For all rows d with |d − k| > D:
-            a[r, k, j, i] → ¬t[r, i, d]
-            (ion i cannot choose a target row d more than D steps away from its current row k.)
-
-        This enforces:
-            max_{r,i} max( |c_dest − c_src|, |d_dest − d_src| ) ≤ D
-
-        and the rest of the constraints guarantee that such a move pattern is globally consistent
-        with BT pins and pair constraints.
-
-        (8) Boundary-avoidance (only in the second level, as soft constraints):
-        - For all rounds r, for all pairs (i1, i2) ∈ P_arr[r]:
-            Soft clauses:
-            - ¬x[r, i1, m−1]   with weight w_B_col
-            - ¬t[r, i1, n−1]   with weight w_B_row
-            - ¬x[r, i2, m−1]   with weight w_B_col
-            - ¬t[r, i2, n−1]   with weight w_B_row
-
-        These softly discourage interacting ions from being routed to the last column and last row,
-        subject to not violating the hard constraints and the distance bound D. 
-
-        Complexity:
-        The asymptotic worst-case looks like O(R n² m²), which is inherent to modeling all ions
-        and all cells explicitly, but subgrid slicing means there are many unit clauses (you never feed the full chip to one SAT instance).
-        The hard part (finding a feasible layout respecting BT and pairs) is done by SAT, which scales
-        more predictably than a heavy weighted MaxSAT.
-        The MAXSAT stage operates on the same structural CNF but adds only a small number of soft
-        boundary clauses, so its overhead remains close to a single SAT run.
-        """
-
-        DEBUG_DIAG = True
-        DEBUG_DIAG_DETAILED = False
-
-
-        A_in = np.asarray(A_in, dtype=int)
-        n, m = A_in.shape
-        R = len(P_arr)
-
-        if BT is None:
-            BT = [{} for _ in range(R)]
-
-        row_of = {int(A_in[r, c]): r for r in range(n) for c in range(m)}
-        ions_all = set(int(x) for x in A_in.flatten())
-
-        if active_ions is None:
-            active_ions=set()
-         
-            # -------------------------------
-            # Identify "active" vs "spectator" ions
-            # -------------------------------
-            active_ions = set()
-            # Any ion in a pair is active
-            for r, pairs in enumerate(P_arr):
-                for i1, i2 in pairs:
-                    if i1 in ions_all:
-                        active_ions.add(i1)
-                    if i2 in ions_all:
-                        active_ions.add(i2)
-            # Any ion pinned in BT is also active
-            for r, bt in enumerate(BT):
-                for i in bt.keys():
-                    if i in ions_all:
-                        active_ions.add(i)
-
-        spectator_ions = ions_all - set(active_ions)
-
-        if DEBUG_DIAG:
-            print(
-                f"[WISE] ions_all={len(ions_all)}, "
-                f"active_ions={len(active_ions)}, "
-                f"spectator_ions={len(spectator_ions)}",
-                flush=True,
-            )
-
-
-        # -------------------------------
-        # Pre-checks (same semantics as before)
-        # -------------------------------
-
-        # (a) No two ions pinned to the same (d,c) in a round
-        for r, bt in enumerate(BT):
-            seen = {}
-            for i, (d, c) in bt.items():
-                if i not in ions_all:
-                    continue
-                if (d, c) in seen:
-                    raise ValueError(
-                        f"UNSAT: BT[{r}] pins ions {seen[(d,c)]} and {i} "
-                        f"to the same cell (d={d}, c={c})."
-                    )
-
-        # (b) Pair vs BT conflicts: same round, incompatible BT rows/blocks
-        for r, pairs in enumerate(P_arr):
-            for i1, i2 in pairs:
-                if i1 not in ions_all or i2 not in ions_all:
-                    continue
-                if i1 in BT[r] and i2 in BT[r]:
-                    d1, c1 = BT[r][i1]
-                    d2, c2 = BT[r][i2]
-                    if d1 != d2:
-                        raise ValueError(
-                            f"UNSAT: round {r} pair {(i1,i2)} BT rows differ: {d1} vs {d2}."
-                        )
-                    if (c1 // k) != (c2 // k):
-                        raise ValueError(
-                            f"UNSAT: round {r} pair {(i1,i2)} BT blocks differ: {c1}//{k} vs {c2}//{k}."
-                        )
-
-        # (c) Round-0: same source row & same target column among reserved ions
-        if len(BT) >= 1:
-            buckets = {}
-            for i, (d0, c0) in BT[0].items():
-                if i not in ions_all:
-                    continue
-                sr = row_of[i]
-                buckets.setdefault((sr, c0), []).append(i)
-            bad = {key: vs for key, vs in buckets.items() if len(vs) > 1}
-            if bad:
-                raise ValueError(
-                    "UNSAT: round 0 has reserved ions from the same start row "
-                    f"targeting the same column: {bad}"
-                )
-
-        # (d) Column oversubscription from BT
-        for r, bt in enumerate(BT):
-            col_counts = {}
-            for i, (_, c) in bt.items():
-                if i not in ions_all:
-                    continue
-                col_counts[c] = col_counts.get(c, 0) + 1
-            bad_cols = {c: cnt for c, cnt in col_counts.items() if cnt > n}
-            if bad_cols:
-                raise ValueError(
-                    f"UNSAT: BT[{r}] pins {bad_cols} ions to one column, exceeds n={n}."
-                )
-
-        ions = sorted(ions_all)
-        num_blocks = math.ceil(m / k)
-
-        # -------------------------------
-        # Structural CNF / WCNF builder
-        # -------------------------------
-        def build_structural_cnf(
-            D_bound: int,
-            use_wcnf: bool = False,
-            add_boundary_soft: bool = False,
-            phase_label: str = "",
-        ):
-            """
-            Build CNF (or WCNF) encoding:
-
-            Vars:
-                a[r,k,j,i] : layout at round r (r=0..R)
-                x[r,i,c]   : dest column in round r
-                t[r,i,d]   : dest row    in round r
-                w[r,i,b]   : dest block  in round r
-                p[r,k,i]   : ion i present in row k at layout a[r]
-                y[r,k,c,i] : ion i in row k targeting col c at round r
-                h[r,δ], v[r,δ] : band variables (MaxSAT stage only)
-
-            Hard:
-                - a: exactly one ion per cell for r=0..R,
-                - initial a[0] equals A_in,
-                - x/t one-hot **only for non-reserved ions**,
-                - w link only for non-reserved ions,
-                - BT pins: x/t/w units + a[r+1,d_fix,c_fix,i],
-                - pair equalities on t and w,
-                - a[r+1] <-> (x[r], t[r]),
-                - p & y semantics (reserved vs free),
-                - bound: |c - j| <= D_bound and |d - k| <= D_bound.
-
-            Soft (when use_wcnf=True):
-                - band variables penalising larger displacements,
-                - optional boundary avoidance on last row/col for interacting ions.
-            """
-
-            vpool = IDPool()
-
-            def var_a(r, k, j, i):  return vpool.id(('a', r, k, j, i))
-            def var_x(r, i, c):     return vpool.id(('x', r, i, c))
-            def var_t(r, i, d):     return vpool.id(('t', r, i, d))
-            def var_w(r, i, b):     return vpool.id(('w', r, i, b))
-            def var_p(r, k, i):     return vpool.id(('p', r, k, i))
-            def var_y(r, k, c, i):  return vpool.id(('y', r, k, c, i))
-            def var_h(r, delta):    return vpool.id(('h', r, delta))
-            def var_v(r, delta):    return vpool.id(('v', r, delta))
-
-            def is_reserved(r, i):  return i in BT[r]
-
-            stats = Counter()
-
-            if use_wcnf:
-                f = WCNF()
-
-                def add_hard(cl, tag=None):
-                    if tag is not None:
-                        stats[tag] += 1
-                    f.append(cl)
-
-                def add_soft(cl, w, tag=None):
-                    if tag is not None:
-                        stats[tag] += 1
-                    f.append(cl, weight=w)
-            else:
-                f = CNF()
-
-                def add_hard(cl, tag=None):
-                    if tag is not None:
-                        stats[tag] += 1
-                    f.append(cl)
-
-                def add_soft(cl, w, tag=None):
-                    raise RuntimeError("soft clauses not allowed in pure CNF")
-
-            # --- high-level debug about this call ---
-            if DEBUG_DIAG:
-                print(
-                    f"[WISE] build_structural_cnf({phase_label}): "
-                    f"D_bound={D_bound}, use_wcnf={use_wcnf}, "
-                    f"boundary_soft={add_boundary_soft}, n={n}, m={m}, R={R}",
-                    flush=True,
-                )
-                for r in range(R):
-                    res_r = sum(1 for i in ions if i in BT[r])
-                    free_r = len(ions) - res_r
-                    print(
-                        f"        round {r}: |Res_r|={res_r}, |Free_r|={free_r}, "
-                        f"|P[r]|={len(P_arr[r])}, |BT[r]|={len(BT[r])}",
-                        flush=True,
-                    )
-
-            # (0) a-cardinality: exactly one ion per cell for r=0..R
-            for r in range(R + 1):
-                for krow in range(n):
-                    for jcol in range(m):
-                        lits = [var_a(r, krow, jcol, i) for i in ions]
-                        enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                        for cl in enc.clauses:
-                            add_hard(cl, tag="a_card")
-
-            # (1) initial layout a[0]
-            for krow in range(n):
-                for jcol in range(m):
-                    ion0 = int(A_in[krow, jcol])
-                    add_hard([var_a(0, krow, jcol, ion0)], tag="init")
-
-            # (2) BT units and x/t/w-onehot for **free** ions
-            for r in range(R):
-                for i in ions:
-                    if is_reserved(r, i):
-                        # reserved: BT gives units, no equals on x/t/w
-                        d_fix, c_fix = BT[r][i]
-                        add_hard([var_x(r, i, c_fix)], tag="BT_x")
-                        add_hard([var_t(r, i, d_fix)], tag="BT_t")
-                        add_hard([var_w(r, i, c_fix // k)], tag="BT_w")
-                        # fix layout after this round
-                        add_hard([var_a(r + 1, d_fix, c_fix, i)], tag="BT_a_next")
-                    else:
-                        # free ion: x one-hot
-                        lits_x = [var_x(r, i, c) for c in range(m)]
-                        encx = CardEnc.equals(lits=lits_x, encoding=EncType.ladder, vpool=vpool)
-                        for cl in encx.clauses:
-                            add_hard(cl, tag="x_onehot")
-                        # free ion: t one-hot
-                        lits_t = [var_t(r, i, d) for d in range(n)]
-                        enct = CardEnc.equals(lits=lits_t, encoding=EncType.ladder, vpool=vpool)
-                        for cl in enct.clauses:
-                            add_hard(cl, tag="t_onehot")
-
-            # (3) w-link for free ions (reserved ions got w fixed above)
-            for r in range(R):
-                for i in ions:
-                    if not is_reserved(r, i):
-                        for b in range(num_blocks):
-                            cols = list(range(b * k, min((b + 1) * k, m)))
-                            wv = var_w(r, i, b)
-                            add_hard([-wv] + [var_x(r, i, c) for c in cols], tag="w_link")
-                            for c in cols:
-                                add_hard([-var_x(r, i, c), wv], tag="w_link")
-
-            # (4) pair constraints: same dest row & block
-            for r in range(R):
-                for (i1, i2) in P_arr[r]:
-                    if i1 not in ions or i2 not in ions:
-                        continue
-                    for d in range(n):
-                        add_hard([-var_t(r, i1, d), var_t(r, i2, d)], tag="pair_t")
-                        add_hard([-var_t(r, i2, d), var_t(r, i1, d)], tag="pair_t")
-                    for b in range(num_blocks):
-                        add_hard([-var_w(r, i1, b), var_w(r, i2, b)], tag="pair_w")
-                        add_hard([-var_w(r, i2, b), var_w(r, i1, b)], tag="pair_w")
-
-            # (5) glue: a[r+1,d,c,i] <-> (x[r,i,c] & t[r,i,d]) for *all* ions
-            for r in range(R):
-                for i in ions:
-                    for d in range(n):
-                        for c in range(m):
-                            a_next = var_a(r + 1, d, c, i)
-                            xv = var_x(r, i, c)
-                            tv = var_t(r, i, d)
-                            add_hard([-a_next, xv], tag="glue")
-                            add_hard([-a_next, tv], tag="glue")
-                            add_hard([-xv, -tv, a_next], tag="glue")
-
-            # (6) p row presence & y linkage
-            for r in range(R):
-                # (6a) p[r,k,i] <-> OR_j a[r,k,j,i]
-                for krow in range(n):
-                    for i in ions:
-                        A_lits = [var_a(r, krow, j, i) for j in range(m)]
-                        add_hard([-var_p(r, krow, i)] + A_lits, tag="p_row")
-                        for aj in A_lits:
-                            add_hard([-aj, var_p(r, krow, i)], tag="p_row")
-
-                # (6b) y at-most-1 and y-link
-                for krow in range(n):
-                    for c in range(m):
-                        # y at-most-1 per (r,krow,c)
-                        y_lits = [var_y(r, krow, c, i) for i in ions]
-                        enc = CardEnc.atmost(lits=y_lits, encoding=EncType.ladder, vpool=vpool)
-                        for cl in enc.clauses:
-                            add_hard(cl, tag="y_atmost")
-
-                        # y linkage, split free vs reserved
-                        for i in ions:
-                            yv = var_y(r, krow, c, i)
-                            pv = var_p(r, krow, i)
-                            if not is_reserved(r, i):
-                                xv = var_x(r, i, c)
-                                add_hard([-yv, xv], tag="y_link_free")
-                                add_hard([-yv, pv], tag="y_link_free")
-                                add_hard([-xv, -pv, yv], tag="y_link_free")
-                            else:
-                                d_fix, c_fix = BT[r][i]
-                                if c == c_fix:
-                                    add_hard([-yv, pv], tag="y_link_res")
-                                    add_hard([-pv, yv], tag="y_link_res")
-                                else:
-                                    add_hard([-yv], tag="y_link_res_zero")
-
-            # (7) movement bound: |c - j| <= D_bound, |d - k| <= D_bound
-            if D_bound is not None:
-                for r in range(R):
-                    for krow in range(n):
-                        for jcol in range(m):
-                            for i in active_ions:
-                                a_src = var_a(r, krow, jcol, i)
-                                # horizontal distance
-                                for c in range(m):
-                                    if abs(c - jcol) > D_bound:
-                                        add_hard([-a_src, -var_x(r, i, c)], tag="move_h")
-                                # vertical distance
-                                for d in range(n):
-                                    if abs(d - krow) > D_bound:
-                                        add_hard([-a_src, -var_t(r, i, d)], tag="move_v")
-
-            # (8) band variables (Level 2 only): h[r,δ], v[r,δ] and softs
-            if use_wcnf and (D_bound is not None) and D_bound > 0:
-                BAND_DELTA_CAP = min(D_bound, 3)  # keep small to avoid blow-up
-
-                # 8a) band monotonicity: h[r,δ+1] -> h[r,δ], same for v
-                for r in range(R):
-                    for delta in range(1, BAND_DELTA_CAP):
-                        add_hard([-var_h(r, delta + 1), var_h(r, delta)])
-                        add_hard([-var_v(r, delta + 1), var_v(r, delta)])
-
-                # 8b) triggers:
-                # If |c-j| = δ and a[r,k,j,i] & x[r,i,c] then h[r,δ],
-                # If |d-k| = δ and a[r,k,j,i] & t[r,i,d] then v[r,δ].
-                for r in range(R):
-                    for krow in range(n):
-                        for jcol in range(m):
-                            for i in active_ions:
-                                a_src = var_a(r, krow, jcol, i)
-                                # horizontal movement
-                                for c in range(m):
-                                    dist = abs(c - jcol)
-                                    if 1 <= dist <= BAND_DELTA_CAP:
-                                        add_hard([-a_src, -var_x(r, i, c), var_h(r, dist)])
-                                # vertical movement
-                                for d in range(n):
-                                    dist = abs(d - krow)
-                                    if 1 <= dist <= BAND_DELTA_CAP:
-                                        add_hard([-a_src, -var_t(r, i, d), var_v(r, dist)])
-
-                # 8c) soft clauses: ¬h[r,δ], ¬v[r,δ] with increasing weight in δ
-                if wH is not None and len(wH) > BAND_DELTA_CAP:
-                    h_weights = wH
-                else:
-                    h_weights = [0] + [delta for delta in range(1, BAND_DELTA_CAP + 1)]
-
-                if wV is not None and len(wV) > BAND_DELTA_CAP:
-                    v_weights = wV
-                else:
-                    v_weights = [0] + [delta for delta in range(1, BAND_DELTA_CAP + 1)]
-
-                for r in range(R):
-                    for delta in range(1, BAND_DELTA_CAP + 1):
-                        add_soft([-var_h(r, delta)], h_weights[delta])
-                        add_soft([-var_v(r, delta)], v_weights[delta])
-
-            # # (9) optional soft boundary-avoidance
-            if use_wcnf and add_boundary_soft and wB_col>0 and wB_row>0:
-                for r in range(R):
-                    for (i1, i2) in P_arr[r]:
-                        if i1 in ions:
-                            add_soft([-var_x(r, i1, m - 1)], wB_col, tag="soft_boundary")
-                            add_soft([-var_t(r, i1, n - 1)], wB_row, tag="soft_boundary")
-                        if i2 in ions:
-                            add_soft([-var_x(r, i2, m - 1)], wB_col, tag="soft_boundary")
-                            add_soft([-var_t(r, i2, n - 1)], wB_row, tag="soft_boundary")
-
-            # --- final debug dump for this build ---
-            if DEBUG_DIAG_DETAILED:
-                if use_wcnf:
-                    total_hard = len(f.hard)
-                    total_soft = len(f.soft)
-                else:
-                    total_hard = len(f.clauses)
-                    total_soft = 0
-
-                print(
-                    f"[WISE] build_structural_cnf({phase_label}) stats:"
-                    f" vars={vpool.top}, hard={total_hard}, soft={total_soft}",
-                    flush=True,
-                )
-                for tag, count in sorted(stats.items()):
-                    print(f"        {tag:16s}: {count} clauses", flush=True)
-
-            return f, vpool, ions, var_a, var_x, var_t
-        
-
-        
-
-
-       
-
-        # -------------------------------
-        # Level 1: SAT + binary search on D (global max displacement)
-        # -------------------------------
-        D_lo = 0
-        D_hi = max(n - 1, m - 1)
-        best_D = None
-
-        if DEBUG_DIAG:
-            print(f"[WISE] starting binary search for D in [0, {D_hi}]", flush=True)
-
-        while D_lo <= D_hi:
-            D_mid = (D_lo + D_hi) // 2
-            cnf_mid, vpool_mid, ions_mid, var_a_mid, var_x_mid, var_t_mid = \
-                build_structural_cnf(
-                    D_mid,
-                    use_wcnf=False,
-                    add_boundary_soft=False,
-                    phase_label=f"D={D_mid}/SAT",
-                )
-
-            t_sat_start = time.time()
-            sat_ok, model_mid, status_sat = run_sat_with_timeout_file(
-                cnf_mid,
-                timeout_s=max_sat_time,
-                debug_prefix="[WISE]",
-            )
-            t_sat_end = time.time()
-
-            if DEBUG_DIAG:
-                print(
-                    f"[WISE]  test D={D_mid}: status={status_sat}, SAT={sat_ok}, "
-                    f"vars={vpool_mid.top}, clauses={len(cnf_mid.clauses)}, "
-                    f"time={t_sat_end - t_sat_start:.3f}s",
-                    flush=True,
-                )
-
-            if status_sat != "ok":
-                # timeout or error
-                if best_D is not None:
-                    # We already have a feasible D; stop search and use it.
-                    if DEBUG_DIAG:
-                        print(
-                            f"[WISE] SAT at D={D_mid} ended with status={status_sat}; "
-                            f"falling back to previous best_D={best_D[0]} and "
-                            "stopping binary search.",
-                            flush=True,
-                        )
-                    break
-                # else:
-                #     # No feasible D found yet => we don't know if instance is solvable
-                #     raise RuntimeError(
-                #         f"SAT solver failed with status={status_sat} "
-                #         "before any feasible D was found."
-                #     )
-
-            # Normal SAT result
-            if sat_ok:
-                # Record this as the best so far and tighten upper bound
-                best_D = (D_mid, model_mid, vpool_mid, ions_mid, var_a_mid)
-                D_hi = D_mid - 1
-            else:
-                # UNSAT: need larger D
-                D_lo = D_mid + 1
-
-        if best_D is None:
-            raise RuntimeError("No feasible layout for any D in [0, max(n-1,m-1)].")
-
-
-        D_star, sat_model_star, vpool_sat, ions_sat, var_a_sat = best_D
-        if DEBUG_DIAG:
-            print(f"[WISE] minimal D* found: {D_star}", flush=True)
-
-        # Build WCNF at D* (with bands + boundary softs)
-        if DEBUG_DIAG:
-            print(f"[WISE] building WCNF at D*={D_star} ...", flush=True)
-
-        t_build_start = time.time()
-        wcnf, vpool_w, ions_w, var_a_w, var_x_w, var_t_w = build_structural_cnf(
-            D_star,
-            use_wcnf=True,
-            add_boundary_soft=True,
-            phase_label=f"D*={D_star}/WCNF",
-        )
-        t_build_end = time.time()
-
-        if DEBUG_DIAG:
-            print(
-                f"[WISE] WCNF built: vars={wcnf.nv}, hard={len(wcnf.hard)}, "
-                f"soft={len(wcnf.soft)}, time={t_build_end - t_build_start:.3f}s",
-                flush=True,
-            )
-
-        model_rc2, cost_rc2, status_rc2 = run_rc2_with_timeout_file(
-            wcnf,
-            timeout_s=max_rc2_time,
-            debug_prefix="[WISE]",
-        )
-
-        if DEBUG_DIAG:
-            print(
-                f"[WISE] RC2 status={status_rc2}, opt_cost={cost_rc2}",
-                flush=True,
-            )
-
-        # Decide which model to use
-        if status_rc2 == "ok" and model_rc2 is not None:
-            # Use MaxSAT-refined model
-            model_used = model_rc2
-            vpool_used = vpool_w
-            var_a_used = var_a_w
-            ions_used  = ions_w
-            if DEBUG_DIAG:
-                print("[WISE] using RC2 MaxSAT model at D*", flush=True)
-        else:
-            # On timeout or error, fall back to SAT model from Level-1
-            if DEBUG_DIAG:
-                print(
-                    "[WISE] MaxSAT unavailable (timeout/error); "
-                    "falling back to SAT model at D*.",
-                    flush=True,
-                )
-            model_used = sat_model_star
-            vpool_used = vpool_sat
-            var_a_used = var_a_sat
-            ions_used  = ions_sat
-
-        # Decode layouts a[1]..a[R] from model_used / var_a_used / ions_used
-        model_set = {l for l in model_used if l > 0}
-
-        def lit_true(v: int) -> bool:
-            return v in model_set
-
-        layouts: List[np.ndarray] = []
-        cur = A_in.copy()
-
-        for r in range(R):
-            nxt = np.empty_like(cur)
-            rr = r + 1  # layout after round r
-            for d in range(n):
-                for c in range(m):
-                    found = None
-                    for i in ions_used:
-                        if lit_true(var_a_used(rr, d, c, i)):
-                            found = i
-                            break
-                    if found is None:
-                        raise RuntimeError(
-                            f"could not reconstruct cell (round={rr}, d={d}, c={c})"
-                        )
-                    nxt[d, c] = found
-            layouts.append(nxt)
-            cur = nxt
-
-        return layouts
-
-
-    @staticmethod
-    def _optimal_QMR_for_WISE2(
-        A_in: np.ndarray,
-        P_arr: List[List[Tuple[int, int]]],
-        *,
-        k: int,
-        BT: List[Dict[int, Tuple[int, int]]] = None,
-        wH: List[int] = None,    # unused in D-min version
-        wV: List[int] = None,    # unused in D-min version
-        wB_col: int = 1,
-        wB_row: int = 1,
-        max_rc2_time: float = 360.0,
         max_sat_time = 1200.0,  
         active_ions: Set[int] = None,
         freeze_seed_prev: Optional[Dict[str, Any]] = None,
         full_P_arr: List[List[Tuple[int, int]]]=[]
-    ) -> Tuple[List[np.ndarray], List[Dict[str, Any]], Dict[str, Any]]:
+    ) -> Tuple[List[np.ndarray], List[List[Dict[str, Any]]], Dict[str, Any]]:
         """
         Three-level optimizer for WISE (Level 2 onwards) with corrected pass-structure
         semantics and clarified BT/pair compatibility constraints.
@@ -2648,10 +1892,7 @@ class GlobalReconfigurations(Operation):
                     boundary_cells.add((n - 1, jcol))
                 boundary_cells = sorted(boundary_cells)
 
-                # Limit rounds we add softs for (helps MaxSAT scaling)
-                rounds_soft_cap = min(R, 2)
-
-                for r in range(rounds_soft_cap):
+                for r in range(R):
                     for ion in ions:
                         in_minor = ion_in_minor_P_arr(r, ion)   # gate in this subgrid
                         in_full  = ion_in_full_P_arr(r, ion)    # gate somewhere (this or later)
@@ -2673,18 +1914,18 @@ class GlobalReconfigurations(Operation):
                                     if jcol == m - 1:
                                         # Cost if ion is TRUE in a boundary cell:
                                         # clause is OR of negative literals, so violation = ion at boundary.
-                                        lits_avoid.append(-var_a(r, P_bound, d, jcol, ion))
+                                        add_soft_clause([-var_a(r, P_bound, d, jcol, ion)], weight=wB_col)
 
                             if wB_row > 0:
                                 # Avoid last-row cells.
                                 for d, jcol in boundary_cells:
                                     if d == n - 1:
-                                        lits_avoid.append(-var_a(r, P_bound, d, jcol, ion))
+                                        add_soft_clause([-var_a(r, P_bound, d, jcol, ion)], weight=wB_row)
 
-                            if lits_avoid:
-                                # Clause satisfied (no cost) if ion stays out of all boundary cells.
-                                # Violated (cost) if ion is placed on any boundary cell.
-                                add_soft_clause(lits_avoid, weight=max(wB_row, wB_col))
+                            # if lits_avoid:
+                            #     # Clause satisfied (no cost) if ion stays out of all boundary cells.
+                            #     # Violated (cost) if ion is placed on any boundary cell.
+                            #     add_clause(lits_avoid)
 
                         # --------------------------------------------------------------
                         # Case 2: ion has no gate in this subgrid but has gates elsewhere
@@ -2697,7 +1938,7 @@ class GlobalReconfigurations(Operation):
                             if lits_pref:
                                 # Clause satisfied (no cost) if ion is TRUE in *some* boundary cell.
                                 # Violated (cost) if ion is interior-only.
-                                add_soft_clause(lits_pref, weight=min(wB_row, wB_col))
+                                add_soft_clause(lits_pref, weight=min(wB_col, wB_row))
 
 
                 # Swap-cost minimisation: penalise s_h and s_v being True
@@ -2825,680 +2066,6 @@ class GlobalReconfigurations(Operation):
             return formula, vpool, ions, var_a
      
 
-
-
-
-
-
-        def run_wise_debug_suite():
-            """
-            Run a compact but comprehensive suite of debug checks for the WISE CNF builder.
-            Assumes globals are available:
-                A_in, P_arr, BT, n, m, k, R, ions, num_blocks,
-                wB_row, wB_col, DEBUG_DIAG,
-                _build_structural_cnf
-            """
-
-            if not DEBUG_DIAG:
-                return
-
-            print("\n========== WISE DEBUG SUITE (UPDATED FOR CELL-BASED s_v) ==========\n")
-
-            # ---------------------- small helpers ----------------------
-
-            def build_no_pair_cnf(P_debug: int, label: str, allow_phase_flips=False):
-                """Call builder with pair constraints disabled (for base structural tests)."""
-                nonlocal P_arr
-                P_saved = P_arr
-                P_arr = [[] for _ in range(R)]
-                cnf, vpool, ions_loc, var_a = _build_structural_cnf(
-                    P_debug,
-                    use_wcnf=False,
-                    add_boundary_soft=False,
-                    phase_label=label,
-                    debug_skip_pair_constraints=True,
-                    debug_allow_phase_flips=allow_phase_flips,
-                )
-                P_arr = P_saved
-                return cnf, vpool, ions_loc, var_a
-
-            def var_s_h_of(vpool, r, p, krow, jcol):
-                return vpool.id(("s_h", r, p, krow, jcol))
-
-            def var_s_v_of(vpool, r, p, krow, jcol):
-                return vpool.id(("s_v", r, p, krow, jcol))
-
-            def var_phase_of(vpool, p):
-                return vpool.id(("phase", p))
-
-            def var_row_end_of(vpool, r, ion, d):
-                return vpool.id(("row_end", r, ion, d))
-
-            def var_w_end_of(vpool, r, ion, b):
-                return vpool.id(("w_end", r, ion, b))
-
-            # 1) Check: is there any model with at least one comparator TRUE? (no pairs)
-            # ------------------------------------------------------------------------
-            def test_any_comparator_active(P_debug=20):
-                print("\n[DEBUG] ===== Checking if any comparator can be active (NO PAIRS) =====")
-                cnf_cmp, vpool_cmp, ions_cmp, _ = build_no_pair_cnf(P_debug, "debug-any-comparator")
-
-                solver_any = Solver(name="glucose4")
-                solver_any.append_formula(cnf_cmp.clauses)
-
-                any_cmp_clause = []
-                for r in range(R):
-                    for p in range(P_debug):
-                        for krow in range(n):
-                            for jcol in range(m - 1):
-                                any_cmp_clause.append(var_s_h_of(vpool_cmp, r, p, krow, jcol))
-                        for krow in range(n - 1):
-                            for jcol in range(m):
-                                any_cmp_clause.append(var_s_v_of(vpool_cmp, r, p, krow, jcol))
-
-                if not any_cmp_clause:
-                    print("[DEBUG] No comparator vars exist at all (unexpected).")
-                    solver_any.delete()
-                    return
-
-                solver_any.add_clause(any_cmp_clause)
-                sat_any = solver_any.solve()
-                print(f"[DEBUG] Exists model with at least one comparator TRUE? {sat_any}")
-                if sat_any:
-                    model = solver_any.get_model()
-                    mset = {l for l in model if l > 0}
-                    def true(lit): return lit in mset
-                    print("[DEBUG] Active comparators in one such model:")
-                    for r in range(R):
-                        for p in range(P_debug):
-                            for krow in range(n):
-                                for jcol in range(m - 1):
-                                    v = var_s_h_of(vpool_cmp, r, p, krow, jcol)
-                                    if true(v):
-                                        print(f"    s_h[r={r}, p={p}, k={krow}, j={jcol}] = True")
-                            for krow in range(n - 1):
-                                for jcol in range(m):
-                                    v = var_s_v_of(vpool_cmp, r, p, krow, jcol)
-                                    if true(v):
-                                        print(f"    s_v[r={r}, p={p}, k={krow}, j={jcol}] = True")
-
-                solver_any.delete()
-
-            # 2) Check: forcing all passes horizontal / all vertical
-            # ------------------------------------------------------
-            def test_phase_force(P_debug=20):
-                print("\n[DEBUG] ===== Forcing all passes horizontal / vertical (NO PAIRS) =====")
-
-                cnf_phase, vpool_phase, _, _ = build_no_pair_cnf(
-                    P_debug, "debug-phase-force", allow_phase_flips=False
-                )
-
-                def sat_with_units(units, label):
-                    s = Solver(name="glucose4")
-                    s.append_formula(cnf_phase.clauses)
-                    for lit in units:
-                        s.add_clause([lit])
-                    ok = s.solve()
-                    print(f"[DEBUG] {label}: SAT? {ok}")
-                    s.delete()
-
-                # all passes horizontal: phase[p] = 0 => ¬phase[p]
-                units_all_h = [-var_phase_of(vpool_phase, p) for p in range(P_debug)]
-                sat_with_units(units_all_h, "all passes horizontal (phase=0)")
-
-                # all passes vertical: phase[p] = 1 => phase[p]
-                units_all_v = [var_phase_of(vpool_phase, p) for p in range(P_debug)]
-                sat_with_units(units_all_v, "all passes vertical (phase=1)")
-
-            # 3) Force some comparator active and inspect layout (r=0)
-            # --------------------------------------------------------
-            def test_force_some_comparator(P_debug=5):
-                print("\n[DEBUG] ===== Forcing some comparator active and inspecting layout =====")
-
-                cnf_move, vpool_move, ions_move, var_a_move = build_no_pair_cnf(
-                    P_debug, "debug-force-move"
-                )
-
-                solver_mv = Solver(name="glucose4")
-                solver_mv.append_formula(cnf_move.clauses)
-
-                at_least_one = []
-                for r in range(R):
-                    for p in range(P_debug):
-                        for krow in range(n):
-                            for jcol in range(m - 1):
-                                at_least_one.append(var_s_h_of(vpool_move, r, p, krow, jcol))
-                        for krow in range(n - 1):
-                            for jcol in range(m):
-                                at_least_one.append(var_s_v_of(vpool_move, r, p, krow, jcol))
-
-                if at_least_one:
-                    solver_mv.add_clause(at_least_one)
-
-                sat_mv = solver_mv.solve()
-                print(f"[DEBUG] base+\"some comparator\" SAT? {sat_mv}")
-                if sat_mv:
-                    model = solver_mv.get_model()
-                    mset = {l for l in model if l > 0}
-                    def true(l): return l in mset
-
-                    def layout_at(p):
-                        grid = np.empty_like(A_in)
-                        for d in range(n):
-                            for c in range(m):
-                                found = None
-                                for ion in ions_move:
-                                    if true(var_a_move(0, p, d, c, ion)):
-                                        found = ion
-                                        break
-                                grid[d, c] = -1 if found is None else found
-                        return grid
-
-                    print("[DEBUG] layout at p=0:")
-                    print(layout_at(0))
-                    print("[DEBUG] layout at p=P_debug:")
-                    print(layout_at(P_debug))
-
-                    print("[DEBUG] comparators TRUE in this model:")
-                    for r in range(R):
-                        for p in range(P_debug):
-                            for krow in range(n):
-                                for jcol in range(m - 1):
-                                    v = var_s_h_of(vpool_move, r, p, krow, jcol)
-                                    if true(v):
-                                        print(f"    s_h[r={r}, p={p}, k={krow}, j={jcol}] = True")
-                            for krow in range(n - 1):
-                                for jcol in range(m):
-                                    v = var_s_v_of(vpool_move, r, p, krow, jcol)
-                                    if true(v):
-                                        print(f"    s_v[r={r}, p={p}, k={krow}, j={jcol}] = True")
-
-                solver_mv.delete()
-
-            # 4) Enumerate reachable end cells for each ion (no pairs)
-            # --------------------------------------------------------
-            def test_reachability_per_ion(P_debug=20):
-                print("\n[DEBUG] ===== Enumerating reachable end cells per ion (NO PAIRS) =====")
-
-                cnf_base, vpool_base, ions_base, var_a_base = build_no_pair_cnf(
-                    P_debug, "debug-reachability"
-                )
-
-                print(f"[DEBUG] base CNF (no pairs): vars={vpool_base.top}, clauses={len(cnf_base.clauses)}")
-
-                def check_reachable(ion, d, c):
-                    s = Solver(name="glucose4")
-                    s.append_formula(cnf_base.clauses)
-                    s.add_clause([var_a_base(0, P_debug, d, c, ion)])
-                    sat = s.solve()
-                    s.delete()
-                    return sat
-
-                for ion in ions_base:
-                    cells = []
-                    for d in range(n):
-                        for c in range(m):
-                            if check_reachable(ion, d, c):
-                                cells.append((d, c))
-                    print(f"  [DEBUG] Ion {ion} reachable end cells: {cells}")
-
-            # 5) Cross-block reachability for specific ions (using w_end)
-            # -----------------------------------------------------------
-            def test_cross_block_reach(P_debug=20, test_ions=(1, 4)):
-                print("\n[DEBUG] ===== Testing cross-block reachability (NO PAIRS) =====")
-
-                cnf_blocks, vpool_blocks, ions_blocks, var_a_blocks = build_no_pair_cnf(
-                    P_debug, "debug-block-reach"
-                )
-
-                num_blocks_local = math.ceil(m / k)
-
-                def block_of_col(j): return j // k
-
-                def can_ion_reach_block(ion, b):
-                    s = Solver(name="glucose4")
-                    s.append_formula(cnf_blocks.clauses)
-                    lits = []
-                    for d in range(n):
-                        for c in range(m):
-                            if block_of_col(c) == b:
-                                lits.append(var_a_blocks(0, P_debug, d, c, ion))
-                    if not lits:
-                        s.delete()
-                        return False
-                    s.add_clause(lits)
-                    sat = s.solve()
-                    s.delete()
-                    return sat
-
-                for ion in test_ions:
-                    if ion not in ions_blocks:
-                        continue
-                    print(f"\n[DEBUG] Ion {ion}:")
-                    for b in range(num_blocks_local):
-                        print(f"    can reach block {b}? {can_ion_reach_block(ion, b)}")
-
-            # 6) Horizontal-only mini-network sanity check (no vertical, no phase)
-            # --------------------------------------------------------------------
-            def test_horizontal_only_toy(P_debug=5):
-                print("\n[DEBUG] ===== Horizontal-only mini-network sanity check =====")
-
-                A0 = np.asarray(A_in, dtype=int)
-                n0, m0 = A0.shape
-                ions0 = sorted(int(x) for x in A0.flatten())
-                num_blocks0 = math.ceil(m0 / k)
-
-                vpool = IDPool()
-                cnf = CNF()
-
-                def var_a(p, krow, jcol, ion): return vpool.id(("aH", p, krow, jcol, ion))
-                def var_s(p, krow, jcol):      return vpool.id(("sH", p, krow, jcol))
-                def block_of_col(j):           return j // k
-
-                # one-ion-per-cell at each p
-                for p in range(P_debug + 1):
-                    for d in range(n0):
-                        for c in range(m0):
-                            lits = [var_a(p, d, c, ion) for ion in ions0]
-                            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                            cnf.extend(enc.clauses)
-
-                # initial layout
-                for d in range(n0):
-                    for c in range(m0):
-                        ion0 = int(A0[d, c])
-                        cnf.append([var_a(0, d, c, ion0)])
-
-                # horizontal semantics
-                for p in range(P_debug):
-                    for d in range(n0):
-                        for c in range(m0 - 1):
-                            s = var_s(p, d, c)
-                            if c % 2 != (p % 2):
-                                cnf.append([-s])
-                            for ion in ions0:
-                                a_c = var_a(p, d, c, ion)
-                                a_c1 = var_a(p, d, c + 1, ion)
-                                a_n = var_a(p + 1, d, c, ion)
-                                a_n1 = var_a(p + 1, d, c + 1, ion)
-
-                                cnf.append([ s, -a_c,  a_n  ])
-                                cnf.append([ s, -a_c1, a_n1 ])
-                                cnf.append([-s, -a_c1, a_n  ])
-                                cnf.append([-s, -a_c,  a_n1 ])
-
-                # ask if ions (1,4) can end in same block
-                pair = (1, 4)
-                for b in range(num_blocks0):
-                    print(f"\n[H-ONLY DEBUG] Trying to place ions {pair} both in block {b} ...")
-                    s = Solver(name="glucose4")
-                    s.append_formula(cnf.clauses)
-                    for ion in pair:
-                        lits = []
-                        for d in range(n0):
-                            for c in range(m0):
-                                if block_of_col(c) == b:
-                                    lits.append(var_a(P_debug, d, c, ion))
-                        s.add_clause(lits)
-                    sat = s.solve()
-                    print(f"    SAT? {sat}")
-                    if sat:
-                        model = s.get_model()
-                        mset = {l for l in model if l > 0}
-                        def true(v): return v in mset
-                        for ion in pair:
-                            cells = []
-                            for d in range(n0):
-                                for c in range(m0):
-                                    if true(var_a(P_debug, d, c, ion)):
-                                        cells.append((d, c))
-                            print(f"      ion {ion} final cells: {cells}")
-                    s.delete()
-
-            # 7) Base CNF SAT? then incremental: +phase monotonicity, +pair constraints
-            # -------------------------------------------------------------------------
-            def test_incremental_pairs(P_test=20):
-                print("\n[DEBUG] ===== Incremental base / phase / pair constraints =====")
-
-                # full builder but with pair constraints skipped
-                cnf_base, vpool_b, ions_b, _ = _build_structural_cnf(
-                    P_test,
-                    use_wcnf=False,
-                    add_boundary_soft=False,
-                    phase_label="debug",
-                    debug_skip_pair_constraints=True,
-                    debug_allow_phase_flips=True,
-                )
-
-                s = Solver(name="glucose4")
-                s.append_formula(cnf_base.clauses)
-                ok = s.solve()
-                print(f"After basic constraints (no pairs, free phase): SAT? {ok}")
-                if not ok:
-                    s.delete()
-                    return
-
-                # add monotonic phase
-                for p in range(P_test - 1):
-                    p0 = var_phase_of(vpool_b, p)
-                    p1 = var_phase_of(vpool_b, p + 1)
-                    s.add_clause([-p0, p1])
-                ok = s.solve()
-                print(f"After adding phase monotonicity: SAT? {ok}")
-                if not ok:
-                    s.delete()
-                    return
-
-                # add all pair constraints for round 0
-                num_blocks_local = math.ceil(m / k)
-                for (i1, i2) in P_arr[0]:
-                    if i1 in ions_b and i2 in ions_b:
-                        for d in range(n):
-                            re1 = var_row_end_of(vpool_b, 0, i1, d)
-                            re2 = var_row_end_of(vpool_b, 0, i2, d)
-                            s.add_clause([-re1, re2])
-                            s.add_clause([-re2, re1])
-                        for b in range(num_blocks_local):
-                            we1 = var_w_end_of(vpool_b, 0, i1, b)
-                            we2 = var_w_end_of(vpool_b, 0, i2, b)
-                            s.add_clause([-we1, we2])
-                            s.add_clause([-we2, we1])
-                ok = s.solve()
-                print(f"After adding pair constraints for all pairs: SAT? {ok}")
-                s.delete()
-
-                # each pair alone
-                cnf_base_single, vpool_single, ions_single, var_a_single = build_no_pair_cnf(
-                    P_test, "debug-single-pair"
-                )
-                num_blocks_single = math.ceil(m / k)
-
-                for (i1, i2) in P_arr[0]:
-                    sp = Solver(name="glucose4")
-                    sp.append_formula(cnf_base_single.clauses)
-                    if i1 in ions_single and i2 in ions_single:
-                        for d in range(n):
-                            re1 = var_row_end_of(vpool_single, 0, i1, d)
-                            re2 = var_row_end_of(vpool_single, 0, i2, d)
-                            sp.add_clause([-re1, re2])
-                            sp.add_clause([-re2, re1])
-                        for b in range(num_blocks_single):
-                            we1 = var_w_end_of(vpool_single, 0, i1, b)
-                            we2 = var_w_end_of(vpool_single, 0, i2, b)
-                            sp.add_clause([-we1, we2])
-                            sp.add_clause([-we2, we1])
-                    sat_single = sp.solve()
-                    print(f"Pair {(i1, i2)} alone: SAT? {sat_single}")
-                    sp.delete()
-
-            # 8) Relaxed block-equality sanity check (no routing at all)
-            # ---------------------------------------------------------
-            def test_relaxed_block_equality(pair=(1, 4)):
-                print("\n[DEBUG] ===== Relaxed block-equality sanity check =====")
-                i1, i2 = pair
-                k_block = k
-                vpool = IDPool()
-                ions_all = sorted(int(x) for x in A_in.flatten())
-                num_blocks_local = math.ceil(m / k_block)
-                P_bound = 0  # only p=0 (no routing)
-
-                def var_a(p, krow, jcol, ion): return vpool.id(("arel", p, krow, jcol, ion))
-                def var_w(ion, b):             return vpool.id(("wrel", ion, b))
-
-                formula = CNF()
-
-                # one-ion-per-cell at p=0 and p=P_bound (same here)
-                for p in (0, P_bound):
-                    for d in range(n):
-                        for c in range(m):
-                            lits = [var_a(p, d, c, ion) for ion in ions_all]
-                            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                            formula.extend(enc.clauses)
-
-                # initial layout fixed at p=0
-                for d in range(n):
-                    for c in range(m):
-                        ion0 = int(A_in[d, c])
-                        formula.append([var_a(0, d, c, ion0)])
-
-                # w_end def at p=P_bound
-                for ion in ions_all:
-                    for b in range(num_blocks_local):
-                        we = var_w(ion, b)
-                        cells = []
-                        for d in range(n):
-                            for j in range(b * k_block, min((b + 1) * k_block, m)):
-                                cells.append(var_a(P_bound, d, j, ion))
-                        if cells:
-                            formula.append([-we] + cells)
-                            for aj in cells:
-                                formula.append([-aj, we])
-                        else:
-                            formula.append([-we])
-
-                # block equality for the pair
-                for b in range(num_blocks_local):
-                    w1b = var_w(i1, b)
-                    w2b = var_w(i2, b)
-                    formula.append([-w1b, w2b])
-                    formula.append([-w2b, w1b])
-
-                s = Solver(name="glucose4")
-                s.append_formula(formula.clauses)
-                sat = s.solve()
-                print(f"[DEBUG relaxed] pair={pair}, SAT? {sat}")
-                s.delete()
-
-            # 9) Base CNF with *full* spec (including pairs) SAT? + inspect layout
-            # --------------------------------------------------------------------
-            def test_full_base_cnf(P_debug=20):
-                print("\n[DEBUG] ===== Full base CNF (with pairs) SAT check =====")
-                cnf_full, vpool_full, ions_full, var_a_full = _build_structural_cnf(
-                    P_debug,
-                    use_wcnf=False,
-                    add_boundary_soft=False,
-                    phase_label="debug-full",
-                )
-                print(f"[DEBUG] base CNF: vars={vpool_full.top}, clauses={len(cnf_full.clauses)}")
-
-                s = Solver(name="glucose4")
-                s.append_formula(cnf_full.clauses)
-                sat = s.solve()
-                print("[DEBUG] base formula SAT? ", sat)
-                if not sat:
-                    s.delete()
-                    return
-
-                model = s.get_model()
-                s.delete()
-                mset = {l for l in model if l > 0}
-
-                def true(v): return v in mset
-
-                def block_of_col(j): return j // k
-                num_blocks_local = math.ceil(m / k)
-
-                # reconstruct layout for r=0, p=P_debug
-                print("\n[DEBUG] End-of-round layout (r=0, p=P_debug):")
-                grid = np.empty_like(A_in)
-                for d in range(n):
-                    for c in range(m):
-                        found = None
-                        for ion in ions_full:
-                            if true(var_a_full(0, P_debug, d, c, ion)):
-                                found = ion
-                                break
-                        grid[d, c] = -1 if found is None else found
-                print(grid)
-
-                print("\n[DEBUG] Initial layout (A_in) with blocks:")
-                print(A_in)
-                for d in range(n):
-                    for c in range(m):
-                        ion = int(A_in[d, c])
-                        print(f"  ion {ion} starts at (row={d}, col={c}, block={block_of_col(c)})")
-
-                print("\n[DEBUG] End-of-round block membership for each ion:")
-                for ion in ions_full:
-                    cells = []
-                    for d in range(n):
-                        for c in range(m):
-                            if true(var_a_full(0, P_debug, d, c, ion)):
-                                cells.append((d, c))
-                    blocks_from_cells = sorted({block_of_col(c) for (_, c) in cells})
-
-                    blocks_from_w = []
-                    for b in range(num_blocks_local):
-                        we = var_w_end_of(vpool_full, 0, ion, b)
-                        if true(we):
-                            blocks_from_w.append(b)
-
-                    print(f"  ion {ion}:")
-                    print(f"     final cells       : {cells}")
-                    print(f"     blocks from cells: {blocks_from_cells}")
-                    print(f"     blocks from w_end: {blocks_from_w}")
-
-            # ---------------------- run all tests ----------------------
-
-            test_any_comparator_active(P_debug=20)
-            test_phase_force(P_debug=20)
-            test_force_some_comparator(P_debug=5)
-            test_reachability_per_ion(P_debug=20)
-            test_cross_block_reach(P_debug=20, test_ions=(1, 4))
-            test_horizontal_only_toy(P_debug=5)
-            test_incremental_pairs(P_test=20)
-            test_relaxed_block_equality(pair=(1, 4))
-            test_full_base_cnf(P_debug=20)
-
-
-            if DEBUG_DIAG:
-                print("\n[DEBUG] ===== Single-comparator micro sanity check =====")
-
-                def _debug_single_comparator_micro():
-                    """
-                    Tiny 1×2, 1-round, 1-pass network:
-
-                        p=0: [1, 2]
-                        p=1: ?
-
-                    We encode:
-                        - exactly-one per cell and per ion at p=0,1
-                        - one horizontal comparator s_h(0,0,0,0)
-                        - SAME swap + copy structure as in _build_structural_cnf,
-                        but without phases or vertical comparators.
-
-                    Then we check:
-                        - SAT with s free,
-                        - SAT with s=0,
-                        - SAT with s=1 and inspect the resulting layout.
-                    """
-                    vpool = IDPool()
-                    n, m = 1, 2
-                    ions = [1, 2]
-                    P_bound = 1  # one pass
-
-                    def var_a(p, krow, jcol, ion):
-                        return vpool.id(("a", p, krow, jcol, ion))
-
-                    def var_s(p, krow, jcol):
-                        return vpool.id(("s_h", p, krow, jcol))
-
-                    cnf = CNF()
-
-                    # (0) exactly-one per cell and per ion at p=0,1
-                    for p in range(P_bound + 1):  # p=0,1
-                        # per cell
-                        for krow in range(n):
-                            for jcol in range(m):
-                                lits = [var_a(p, krow, jcol, ion) for ion in ions]
-                                enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                                cnf.extend(enc.clauses)
-                        # per ion
-                        for ion in ions:
-                            lits = [var_a(p, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
-                            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                            cnf.extend(enc.clauses)
-
-                    # (1) Initial layout at p=0: [1, 2]
-                    cnf.append([var_a(0, 0, 0, 1)])  # cell(0,0) = ion 1
-                    cnf.append([var_a(0, 0, 1, 2)])  # cell(0,1) = ion 2
-
-                    sh = var_s(0, 0, 0)
-
-                    # (2) Horizontal semantics as in the main builder (after our fix):
-                    for ion in ions:
-                        a_cur_j  = var_a(0, 0, 0, ion)
-                        a_cur_j1 = var_a(0, 0, 1, ion)
-                        a_next_j  = var_a(1, 0, 0, ion)
-                        a_next_j1 = var_a(1, 0, 1, ion)
-
-                        # SWAP only for s=1:
-                        # (s ∧ a_cur_j1) -> a_next_j
-                        cnf.append([-sh, -a_cur_j1, a_next_j])
-                        # (s ∧ a_cur_j)  -> a_next_j1
-                        cnf.append([-sh, -a_cur_j,  a_next_j1])
-
-                    # (3) Copy constraints for non-participating cells with "horizontal phase"
-                    # In this micro test, there is only one comparator touching both cells, so:
-                    #   s_left/s_right = sh appropriately.
-
-                    p = 0
-                    for krow in range(n):
-                        for jcol in range(m):
-                            s_left  = var_s(p, krow, jcol - 1) if jcol > 0     else None
-                            s_right = var_s(p, krow, jcol)     if jcol < m - 1 else None
-
-                            lits_ante_neg = []  # we assume "phase=0" so only ¬s_left/¬s_right matter
-                            if s_left is not None:
-                                lits_ante_neg.append(s_left)
-                            if s_right is not None:
-                                lits_ante_neg.append(s_right)
-
-                            for ion in ions:
-                                a_cur  = var_a(0, krow, jcol, ion)
-                                a_next = var_a(1, krow, jcol, ion)
-
-                                # (¬s_left ∧ ¬s_right ∧ a_cur) -> a_next
-                                cnf.append(lits_ante_neg + [-a_cur, a_next])
-                                # (¬s_left ∧ ¬s_right ∧ a_next) -> a_cur
-                                cnf.append(lits_ante_neg + [-a_next, a_cur])
-
-                    def solve_with(extra_units, label):
-                        s = Solver(name="glucose4")
-                        s.append_formula(cnf.clauses)
-                        for u in extra_units:
-                            s.add_clause([u])
-                        sat = s.solve()
-                        print(f"[DEBUG micro] {label}: SAT? {sat}")
-                        if sat:
-                            model = s.get_model()
-                            s.delete()
-                            mset = {l for l in model if l > 0}
-                            def true(v): return v in mset
-
-                            layout0 = [[None for _ in range(m)] for _ in range(n)]
-                            layout1 = [[None for _ in range(m)] for _ in range(n)]
-                            for ion in ions:
-                                for krow in range(n):
-                                    for jcol in range(m):
-                                        if true(var_a(0, krow, jcol, ion)):
-                                            layout0[krow][jcol] = ion
-                                        if true(var_a(1, krow, jcol, ion)):
-                                            layout1[krow][jcol] = ion
-                            print(f"    p=0 layout: {layout0}")
-                            print(f"    p=1 layout: {layout1}")
-                            print(f"    s_h = {true(sh)}")
-                        else:
-                            s.delete()
-
-                    # Run three scenarios:
-                    solve_with([],         "s free")
-                    solve_with([-sh],      "forced s=0")
-                    solve_with([sh],       "forced s=1")
-
-                _debug_single_comparator_micro()
-                print("\n========== END WISE DEBUG SUITE ==========\n")
-
         def decode_wise_schedule_from_model(
             model: List[int],
             vpool,
@@ -3506,7 +2073,7 @@ class GlobalReconfigurations(Operation):
             m: int,
             R: int,
             P_bound: int,
-        ) -> List[Dict[str, Any]]:
+        ) -> List[List[Dict[str, Any]]]:
             """
             Decode the SAT/RC2 model into a per-pass schedule of comparators.
 
@@ -3532,42 +2099,170 @@ class GlobalReconfigurations(Operation):
             def var_phase(p):
                 return vpool.id(("phase", p))
 
-            schedule: List[Dict[str, Any]] = []
+            schedule: List[List[Dict[str, Any]]] = [[] for _ in range(R)]
+            for r in range(R):
+                for p in range(P_bound):
+                    phase_lit = var_phase(p)
+                    is_vertical = (phase_lit <= vpool.top and lit_true(phase_lit))
+                    phase = "V" if is_vertical else "H"
 
-            for p in range(P_bound):
-                phase_lit = var_phase(p)
-                is_vertical = (phase_lit <= vpool.top and lit_true(phase_lit))
-                phase = "V" if is_vertical else "H"
+                    pass_info: Dict[str, Any] = {
+                        "phase": phase,
+                        "h_swaps": [],
+                        "v_swaps": [],
+                    }
 
-                pass_info: Dict[str, Any] = {
-                    "phase": phase,
-                    "h_swaps": [],
-                    "v_swaps": [],
-                }
+                    if phase == "H":
+                        # Horizontal comparators at this pass
+                        for krow in range(n):
+                            for jcol in range(m - 1):
+                                v = var_s_h(r, p, krow, jcol)
+                                if v <= vpool.top and lit_true(v):
+                                    pass_info["h_swaps"].append((krow, jcol))
+                    else:
+                        # Vertical comparators at this pass
+                        for krow in range(n - 1):
+                            for jcol in range(m):
+                                v = var_s_v(r, p, krow, jcol)
+                                if v <= vpool.top and lit_true(v):
+                                    pass_info["v_swaps"].append((krow, jcol))
 
-                # We look at only the next round
-                # TODO: we should probably just run MAXSAT once when doing full lookahead, or have a parameter that decides how many rounds we schedule
-                r=0
-                if phase == "H":
-                    # Horizontal comparators at this pass
-                    for krow in range(n):
-                        for jcol in range(m - 1):
-                            v = var_s_h(r, p, krow, jcol)
-                            if v <= vpool.top and lit_true(v):
-                                pass_info["h_swaps"].append((krow, jcol))
-                else:
-                    # Vertical comparators at this pass
-                    for krow in range(n - 1):
-                        for jcol in range(m):
-                            v = var_s_v(r, p, krow, jcol)
-                            if v <= vpool.top and lit_true(v):
-                                pass_info["v_swaps"].append((krow, jcol))
-
-                schedule.append(pass_info)
+                    schedule[r].append(pass_info)
 
             return schedule
 
-        # run_wise_debug_suite()
+        def wise_debug_boundary_stats(
+            label: str,
+            model: Iterable[int],
+            vpool,
+            var_a,
+            ions: Iterable[int],
+            n_sub: int,
+            m_sub: int,
+            R: int,
+            P_bound: int,
+            core_rows: int,
+            core_cols: int,
+            P_freeze: int,
+            core_ion_set: Iterable[int],
+        ) -> Dict[str, Any]:
+            """
+            Compute how often core ions sit on the 'bad' boundaries for this slice.
+
+            core_rows, core_cols: size of frozen core (n_c, m_c)
+            P_freeze: prefix of passes that will be frozen in the next slice
+            core_ion_set: ions you plan to consider 'frozen' for the next slice (e.g., active ions in this subgrid)
+            """
+            mset = {l for l in model if l > 0}
+            def lit_true(lit: int) -> bool:
+                return lit in mset
+
+            # core_ion_set = set(core_ion_set)
+
+            # boundaries of the *current* subgrid
+            last_row = n_sub - 1
+            last_col = m_sub - 1
+
+            # we only care about region [0..core_rows-1, 0..core_cols-1] and passes [0..P_freeze]
+            n_core = min(core_rows, n_sub)
+            m_core = min(core_cols, m_sub)
+            p_max = min(P_freeze, P_bound)
+
+            total_positions = 0
+            boundary_hits_row = 0
+            boundary_hits_col = 0
+            boundary_hits_corner = 0
+
+            # per-ion counts
+            per_ion_counts: Dict[int, Dict[str, int]] = {
+                ion: {"total": 0, "row": 0, "col": 0, "corner": 0}
+                for ion in core_ion_set
+            }
+
+            for r in range(R):
+                iongates=P_arr[r]
+                ionset = set()
+                for (i1, i2) in iongates:
+                    ionset.add(i1)
+                    ionset.add(i2)
+                for ion in ionset:
+                    # for p in range(p_max + 1):
+                        for d in range(n_core):
+                            for c in range(m_core):
+                                v = var_a(r+1, 0, d, c, ion)
+                                if not lit_true(v):
+                                    continue
+                                total_positions += 1
+                                per_ion_counts[ion]["total"] += 1
+
+                                on_row_boundary = (d == last_row)
+                                on_col_boundary = (c == last_col)
+                                if on_row_boundary:
+                                    boundary_hits_row += 1
+                                    per_ion_counts[ion]["row"] += 1
+                                if on_col_boundary:
+                                    boundary_hits_col += 1
+                                    per_ion_counts[ion]["col"] += 1
+                                if on_row_boundary and on_col_boundary:
+                                    boundary_hits_corner += 1
+                                    per_ion_counts[ion]["corner"] += 1
+
+            # Avoid div-by-zero
+            total_positions = max(total_positions, 1)
+
+            frac_row = boundary_hits_row / total_positions
+            frac_col = boundary_hits_col / total_positions
+            frac_corner = boundary_hits_corner / total_positions
+
+            summary = {
+                "label": label,
+                "n_sub": n_sub,
+                "m_sub": m_sub,
+                "R": R,
+                "P_bound": P_bound,
+                "core_rows": core_rows,
+                "core_cols": core_cols,
+                "P_freeze": P_freeze,
+                "total_positions": total_positions,
+                "boundary_hits_row": boundary_hits_row,
+                "boundary_hits_col": boundary_hits_col,
+                "boundary_hits_corner": boundary_hits_corner,
+                "frac_row": frac_row,
+                "frac_col": frac_col,
+                "frac_corner": frac_corner,
+                "per_ion_counts": per_ion_counts,
+            }
+
+            # Compact, grep-able log line
+            print(
+                f"[WISE-DEBUG] boundary-stats {label}: "
+                f"subgrid={n_sub}x{m_sub}, core={core_rows}x{core_cols}, P_freeze={P_freeze}, "
+                f"pos={total_positions}, "
+                f"row_hits={boundary_hits_row} ({frac_row:.3f}), "
+                f"col_hits={boundary_hits_col} ({frac_col:.3f}), "
+                f"corner_hits={boundary_hits_corner} ({frac_corner:.3f})"
+            )
+
+            # Optionally, also print worst-offending ions (top few):
+            worst = sorted(
+                per_ion_counts.items(),
+                key=lambda kv: (kv[1]["row"] + kv[1]["col"]),
+                reverse=True,
+            )[:5]
+            for ion, stats in worst:
+                if stats["total"] == 0:
+                    continue
+                fr = stats["row"] / stats["total"]
+                fc = stats["col"] / stats["total"]
+                print(
+                    f"[WISE-DEBUG]   ion {ion}: total={stats['total']}, "
+                    f"row={stats['row']} ({fr:.3f}), "
+                    f"col={stats['col']} ({fc:.3f}), "
+                    f"corner={stats['corner']}"
+                )
+
+            return summary
+
         
 
         if freeze_seed_prev is not None:
@@ -3702,23 +2397,6 @@ class GlobalReconfigurations(Operation):
                 else:
                     # UNSAT: need more passes
                     P_lo = P_mid + 1
-
-        
-
-                # if status_sat != "ok":
-                #     # timeout or error
-                #     if best_P is not None:
-                #         if DEBUG_DIAG:
-                #             print(
-                #                 f"[WISE] SAT at P={P_mid} ended with status={status_sat}; "
-                #                 f"falling back to previous best P={best_P[0]} and stopping binary search.",
-                #                 flush=True,
-                #             )
-                #         break
-                #     else:
-                #         raise RuntimeError(
-                #             f"SAT solver failed with status={status_sat} before any feasible P was found."
-                #         )
             
             if (P_star is not None) or (n_c==0 or m_c==0):
                 break
@@ -3738,6 +2416,42 @@ class GlobalReconfigurations(Operation):
         if DEBUG_DIAG:
             print(f"[WISE] minimal P* found: {P_star}", flush=True)
 
+
+        layouts_before: List[np.ndarray] = []
+        cur = A_in.copy()
+
+        for r in range(R):
+            nxt = np.empty_like(cur)
+            for d in range(n):
+                for c in range(m):
+                    found = None
+                    for ion in ions_sat:
+                        if var_a_sat(r, P_star, d, c, ion) in sat_model_star:
+                            found = ion
+                            break
+                    if found is None:
+                        raise RuntimeError(
+                            f"Could not reconstruct cell (round={r}, d={d}, c={c})"
+                        )
+                    nxt[d, c] = found
+            layouts_before.append(nxt)
+            cur = nxt
+
+        _ = wise_debug_boundary_stats(
+            label="BEFORE MAXSAT",
+            model=sat_model_star,
+            vpool=vpool_sat,
+            var_a=var_a_sat,
+            ions=ions,
+            n_sub=n,
+            m_sub=m,
+            R=R,
+            P_bound=P_star,
+            core_rows=n,       # current core size you *plan* to freeze in next slice
+            core_cols=m,
+            P_freeze=P_freeze,
+            core_ion_set=ions_sat,
+        )
         # -------------------------------
         # Level 3: MaxSAT refinement at P*
         # -------------------------------
@@ -3777,70 +2491,6 @@ class GlobalReconfigurations(Operation):
                 flush=True,
             )
 
-        # if DEBUG_DIAG:
-        #     print("\n[DEBUG] ===== Decoding used passes from RC2 model =====")
-
-        #     # model: list[int] from RC2
-        #     model_set = {lit for lit in model_rc2 if lit > 0}
-
-        #     def lit_true(v: int) -> bool:
-        #         return v in model_set
-
-        #     # Helpers must match the IDs used in _build_structural_cnf
-        #     def var_s_h_dec(r, p, krow, jcol):
-        #         return vpool_w.id(("s_h", r, p, krow, jcol))
-
-        #     def var_s_v_dec(r, p, krow, jcol):
-        #         return vpool_w.id(("s_v", r, p, krow, jcol))
-
-            # def var_phase_dec(p):
-            #     return vpool_w.id(("phase", p))
-
-            # max_p_with_cmp = -1
-            # max_p_with_h = -1
-            # max_p_with_v = -1
-
-            # for r in range(R):
-            #     for p in range(P_star):        # note: 0..P_bound-1
-            #         any_h = False
-            #         any_v = False
-
-            #         # horizontal comparators at this pass
-            #         for krow in range(n):
-            #             for jcol in range(m - 1):
-            #                 v = var_s_h_dec(r, p, krow, jcol)
-            #                 if v <= vpool_w.top and lit_true(v):
-            #                     any_h = True
-
-        #             # vertical comparators at this pass
-        #             for krow in range(n - 1):
-        #                 for jcol in range(m):
-        #                     v = var_s_v_dec(r, p, krow, jcol)
-        #                     if v <= vpool_w.top and lit_true(v):
-        #                         any_v = True
-
-        #             if any_h or any_v:
-        #                 max_p_with_cmp = max(max_p_with_cmp, p)
-        #                 if any_h:
-        #                     max_p_with_h = max(max_p_with_h, p)
-        #                 if any_v:
-        #                     max_p_with_v = max(max_p_with_v, p)
-
-        #     print(f"[DEBUG] P_bound (P*)   = {P_star}")
-        #     print(f"[DEBUG] max p with any comparator TRUE = {max_p_with_cmp}")
-        #     print(f"[DEBUG] max p with H comparator TRUE   = {max_p_with_h}")
-        #     print(f"[DEBUG] max p with V comparator TRUE   = {max_p_with_v}")
-
-        #     # Also dump phase pattern for clarity
-        #     phase_vals = []
-        #     for p in range(P_star):
-        #         v = var_phase_dec(p)
-        #         val = None
-        #         if v <= vpool_w.top:
-        #             val = 1 if lit_true(v) else 0
-        #         phase_vals.append(val)
-        #     print(f"[DEBUG] phase[p] for p=0..{P_star-1}: {phase_vals}")
-        # # Decide which model to use
         if status_rc2 == "ok" and model_rc2 is not None:
             model_used = model_rc2
             vpool_used = vpool_w
@@ -3859,6 +2509,28 @@ class GlobalReconfigurations(Operation):
                     "falling back to SAT model at P*.",
                     flush=True,
                 )
+
+        # Decide which ions are "core" for this slice.
+        # A reasonable default: all active ions that lie entirely in the current subgrid.
+        # If you already have a list `core_ions_this_slice`, reuse that here.
+        core_ions_this_slice = ions   # or a filtered subset if you prefer
+
+        _ = wise_debug_boundary_stats(
+            label="AFTER MAXSAT",
+            model=model_used,
+            vpool=vpool_used,
+            var_a=var_a_used,
+            ions=ions,
+            n_sub=n,
+            m_sub=m,
+            R=R,
+            P_bound=P_star,
+            core_rows=n,       # current core size you *plan* to freeze in next slice
+            core_cols=m,
+            P_freeze=P_freeze,
+            core_ion_set=core_ions_this_slice,
+        )
+
 
         # -------------------------------
         # Decode layouts a[r,P_star] from model_used
@@ -3921,6 +2593,7 @@ class GlobalReconfigurations(Operation):
         newAssignment: Sequence[Sequence[int]],
         ignoreSpectators: bool = False,
         sat_schedule: List[Dict[str, Any]] = None,   # NEW: decoded schedule from RC2
+        initial_placement: bool = False
     ) -> Tuple[Mapping[int, float], float]:
         """
         Shapes:
@@ -4045,11 +2718,11 @@ class GlobalReconfigurations(Operation):
                 print(T)
                 # You can raise if you want:
                 # raise RuntimeError("SAT schedule did not realise target layout")
-
-            print(
-                f"RECONFIGURATION (SAT schedule): {acc_passes} passes were needed for the current reconfiguration round, "
-                f"taking {timeElapsed} time and {heatingRates} heating"
-            )
+            if not initial_placement:
+                print(
+                    f"RECONFIGURATION (SAT schedule): {acc_passes} passes were needed for the current reconfiguration round, "
+                    f"taking {timeElapsed} time and {heatingRates} heating"
+                )
             return heatingRates, timeElapsed
 
         # ======================================================================
@@ -4170,10 +2843,11 @@ class GlobalReconfigurations(Operation):
             timeElapsed += evenpass * row_swap_time
             acc_cost += int(oddpass) + int(evenpass)
 
-        print(
-            f"RECONFIGURATION: {acc_cost} passes were needed for the current reconfiguration round, "
-            f"taking {timeElapsed} time and {heatingRates} heating"
-        )
+        if not initial_placement:
+            print(
+                f"RECONFIGURATION: {acc_cost} passes were needed for the current reconfiguration round, "
+                f"taking {timeElapsed} time and {heatingRates} heating"
+            )
         return heatingRates, timeElapsed
     @classmethod
     def _runOddEvenReconfig2(
