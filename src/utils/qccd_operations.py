@@ -36,7 +36,47 @@ from scipy import stats
 from pysat.solvers import Solver
 import math
 
-def _sat_worker_from_file(cnf_path: str, result_path: str):
+# ---------- UNSAT core helpers ----------
+
+
+class CoreGroups:
+    """
+    Manage assumption selectors for clause families to enable UNSAT core debug.
+    Clauses guarded under selector s_g are added as (clause ∨ s_g).
+    Solving with assumption ¬s_g activates the group; cores then map back to names.
+    """
+
+    def __init__(self, vpool: IDPool, enabled: bool, granularity: str = "coarse"):
+        self.vpool = vpool
+        self.enabled = enabled
+        self.granularity = granularity
+        self.sel: Dict[str, int] = {}
+        self.meta: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+    def lit(self, name: str) -> int:
+        if name not in self.sel:
+            self.sel[name] = self.vpool.id(("grp", name))
+        return self.sel[name]
+
+    def add(
+        self,
+        formula: CNF,
+        cl: List[int],
+        group: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not self.enabled:
+            formula.append(cl)
+            return
+        formula.append(cl + [self.lit(group)])
+        if meta is not None:
+            self.meta[group].append(meta)
+
+def _sat_worker_from_file(
+    cnf_path: str,
+    result_path: str,
+    assumptions: Optional[List[int]] = None,
+):
     """
     Worker process entry for plain SAT:
       - loads CNF from cnf_path,
@@ -50,7 +90,10 @@ def _sat_worker_from_file(cnf_path: str, result_path: str):
             cnf = pickle.load(f)   # CNF object or just clauses
 
         with Minisat22(bootstrap_with=cnf.clauses) as sat:
-            sat_ok = sat.solve()
+            if assumptions is None:
+                sat_ok = sat.solve()
+            else:
+                sat_ok = sat.solve(assumptions=assumptions)
             model = sat.get_model() if sat_ok else None
 
         t1 = time.time()
@@ -79,6 +122,7 @@ def run_sat_with_timeout_file(
     cnf: CNF,
     timeout_s: float,
     debug_prefix: str = "[WISE]",
+    assumptions: Optional[List[int]] = None,
 ):
     """
     Run Minisat22 on 'cnf' in a separate process with a wall-clock timeout.
@@ -89,6 +133,9 @@ def run_sat_with_timeout_file(
       - status == "error"     : sat_ok, model are None (worker crashed).
       - status == "user_abort": sat_ok, model are None (parent got KeyboardInterrupt
                                 while waiting; worker terminated & cleaned up).
+
+    If `assumptions` is provided, the SAT call uses those literals (usually the
+    negated selector vars from CoreGroups) so guarded clauses remain active.
     """
 
     if timeout_s is not None and timeout_s <= 0:
@@ -106,8 +153,10 @@ def run_sat_with_timeout_file(
         with open(cnf_path, "wb") as f:
             pickle.dump(cnf, f)
 
-        p = mp.Process(target=_sat_worker_from_file,
-                       args=(cnf_path, result_path))
+        p = mp.Process(
+            target=_sat_worker_from_file,
+            args=(cnf_path, result_path, assumptions),
+        )
         p.daemon = True
 
         if debug_prefix:
@@ -616,7 +665,8 @@ class GlobalReconfigurations(Operation):
         max_sat_time = 1200.0,  
         active_ions: Set[int] = None,
         freeze_seed_prev: Optional[Dict[str, Any]] = None,
-        full_P_arr: List[List[Tuple[int, int]]]=[]
+        full_P_arr: List[List[Tuple[int, int]]]=[],
+        ignore_initial_reconfig: bool = False,
     ) -> Tuple[List[np.ndarray], List[List[Dict[str, Any]]], Dict[str, Any]]:
         """
         Three-level optimizer for WISE (Level 2 onwards) with corrected pass-structure
@@ -1377,6 +1427,7 @@ class GlobalReconfigurations(Operation):
         A_in = np.asarray(A_in, dtype=int)
         n, m = A_in.shape
         R = len(P_arr)
+        optimize_round_start = 1 if (ignore_initial_reconfig and R > 0) else 0
 
         if BT is None:
             BT = [{} for _ in range(R)]
@@ -1388,10 +1439,13 @@ class GlobalReconfigurations(Operation):
         FREEZE_POS_ONLY = "POS_ONLY"
         FREEZE_NONE     = "NONE"
 
+        CAPACITY = k
+
         # -------------------------------
         # Basic sets of ions
         # -------------------------------
         row_of = {int(A_in[r, c]): r for r in range(n) for c in range(m)}
+        col_of = {int(A_in[r, c]): c for r in range(n) for c in range(m)}
         ions_all = set(int(x) for x in A_in.flatten())
 
         if active_ions is None:
@@ -1489,15 +1543,24 @@ class GlobalReconfigurations(Operation):
         # -------------------------------
         def _build_structural_cnf(
             P_bound: int,
+            sum_bound_B: Optional[int] = None,
             use_wcnf: bool = False,
             add_boundary_soft: bool = False,
             phase_label: str = "",
             debug_skip_pair_constraints: bool = False,
             debug_allow_phase_flips: bool = False,
-            freeze_params: Optional[Dict[str, Any]]=None
+            freeze_params: Optional[Dict[str, Any]] = None,
+            skip_freeze_sanity: bool = False,
+            optimize_round_start: int = 0,
+            debug_core: bool = False,
+            core_granularity: str = "coarse",
+            debug_skip_cardinality: bool = False,
+            debug_disable_pairs_rounds: Optional[Set[int]] = None,
         ):
             """
             Build CNF (or WCNF) encoding for a given pass budget P_bound, capturing rounds 0..R-1 (inclusive).
+            Optionally enforce a global cardinality bound sum_bound_B on the sum of per-round
+            pass usages (Σ_r P_r) via unary auxiliaries.
 
             Variables:
                 a[r, p, k, j, i] : Ion i occupies cell (row=k, col=j) at micro-pass p of round r.
@@ -1531,10 +1594,16 @@ class GlobalReconfigurations(Operation):
             def var_s_v(r, p, krow, jcol):
                 return vpool.id(("s_v", r, p, krow, jcol))
 
-            def var_phase(p):
-                # phase[p] = 0 => horizontal passes
-                # phase[p] = 1 => vertical passes (and once 1, remains 1 unless debug_allow_phase_flips)
-                return vpool.id(("phase", p))
+            def var_phase(r, p):
+                """
+                Per-round phase:
+                    phase[r,p] = 0 => horizontal at (round r, pass p),
+                    phase[r,p] = 1 => vertical at (round r, pass p).
+
+                We enforce monotonicity separately for each round:
+                    phase[r,p] -> phase[r,p+1]   for p < P_bounds[r]-1.
+                """
+                return vpool.id(("phase", r, p))
 
             def var_row_end(r, ion, d):
                 return vpool.id(("row_end", r, ion, d))
@@ -1542,12 +1611,15 @@ class GlobalReconfigurations(Operation):
             def var_w_end(r, ion, b):
                 return vpool.id(("w_end", r, ion, b))
 
+            def var_u(r, p):
+                return vpool.id(("u", r, p))
+
             def is_reserved(r, ion):
                 return ion in BT[r]
-            
+
             def ion_in_full_P_arr(r, ion):
                 return any((ion in g) for g in full_P_arr[r])
-            
+
             def ion_in_minor_P_arr(r, ion):
                 return any((ion in g) for g in P_arr[r]) or is_reserved(r, ion)
 
@@ -1555,75 +1627,379 @@ class GlobalReconfigurations(Operation):
 
             if use_wcnf:
                 formula = WCNF()
-
-                def add_clause(cl):
-                    formula.append(cl)
-
-                def add_soft_clause(cl, weight=1):
-                    formula.append(cl, weight=weight)
-
             else:
                 formula = CNF()
 
-                def add_clause(cl):
-                    formula.append(cl)
+            grp = CoreGroups(
+                vpool=vpool,
+                enabled=(debug_core and not use_wcnf),
+                granularity=core_granularity,
+            )
 
-                def add_soft_clause(cl, weight=1):
+            def add_hard(
+                cl: List[int],
+                group_name: str,
+                meta: Optional[Dict[str, Any]] = None,
+            ) -> None:
+                if use_wcnf:
+                    formula.append(cl)
+                else:
+                    grp.add(formula, cl, group_name, meta=meta)
+
+            def add_soft(cl: List[int], weight: int = 1) -> None:
+                if use_wcnf:
+                    formula.append(cl, weight=weight)
+                else:
                     raise RuntimeError("Soft clauses not allowed in pure CNF mode")
 
-            # if DEBUG_DIAG:
-            #     print(
-            #         f"[WISE] build_structural_cnf({phase_label}): "
-            #         f"P_bound={P_bound}, use_wcnf={use_wcnf}, "
-            #         f"boundary_soft={add_boundary_soft}, n={n}, m={m}, R={R}",
-            #         flush=True,
-            #     )
-            #     for r in range(R):
-            #         res_r = sum(1 for i in ions if i in BT[r])
-            #         free_r = len(ions) - res_r
-            #         print(
-            #             f"        round {r}: |Res_r|={res_r}, |Free_r|={free_r}, "
-            #             f"|P[r]|={len(P_arr[r])}, |BT[r]|={len(BT[r])}",
-            #             flush=True,
-            #         )
+            if debug_disable_pairs_rounds is None:
+                disable_pairs_rounds: Set[int] = set()
+            else:
+                disable_pairs_rounds = set(debug_disable_pairs_rounds)
+
+            P_bounds = ([P_bound + n + m] * optimize_round_start + [P_bound] * (R - optimize_round_start))
+
+            # ------------------------------------------------------------------
+            # Frozen-core preprocessing: build maps from old model
+            # ------------------------------------------------------------------
+            frozen_cell_ion: Dict[Tuple[int, int, int, int], int] = {}
+            frozen_ion_pos: Dict[Tuple[int, int, int], Tuple[int, int]] = {}
+
+            freeze_mode = FREEZE_NONE
+            # Begin freezing strictly after the ignored rounds so early rounds can reconfigure.
+            freeze_round_start = optimize_round_start
+
+            freeze_ions: Optional[Set[int]] = None
+            freeze_pass_whitelist: Optional[List[int]] = None
+
+            n_core = 0
+            m_core = 0
+            P_freeze = 0
+            old_truth = None
+            round_active_ions: Dict[int, Set[int]] = {}
+            for r_pa, pairs_pa in enumerate(P_arr):
+                s = round_active_ions.setdefault(r_pa, set())
+                for i1, i2 in pairs_pa:
+                    s.add(i1)
+                    s.add(i2)
+
+            if freeze_params is not None:
+                freeze_mode = freeze_params.get("mode", FREEZE_NONE)
+                if freeze_mode != FREEZE_NONE:
+                    n_core = min(freeze_params.get("n_core", 0), n)
+                    m_core = min(freeze_params.get("m_core", 0), m)
+                    P_freeze = min(freeze_params.get("P_freeze", 0), P_bound)
+                    prev_vpool = freeze_params.get("prev_vpool", None)
+                    prev_true_set = freeze_params.get("prev_true_set", None)
+                    freeze_ions_param = freeze_params.get("freeze_ions", None)
+                    freeze_passes_raw = freeze_params.get("freeze_passes", None)
+                    if freeze_passes_raw:
+                        cleaned_passes: Set[int] = set()
+                        for p in freeze_passes_raw:
+                            try:
+                                cleaned_passes.add(int(p))
+                            except (TypeError, ValueError):
+                                continue
+                        if cleaned_passes:
+                            freeze_pass_whitelist = sorted(cleaned_passes)
+
+                    core_region_ions: Set[int] = set()
+                    for r0 in range(min(n_core, n)):
+                        for c0 in range(min(m_core, m)):
+                            core_region_ions.add(int(A_in[r0, c0]))
+
+                    freeze_ions_local = set(core_region_ions)
+
+                    ions_in_P_arr: Set[int] = set()
+                    for pairs in P_arr:
+                        for i1, i2 in pairs:
+                            ions_in_P_arr.add(i1)
+                            ions_in_P_arr.add(i2)
+
+                    freeze_ions_local.difference_update(ions_in_P_arr)
+
+                    if freeze_ions_param is not None:
+                        freeze_ions_local &= set(freeze_ions_param)
+
+                    freeze_ions = freeze_ions_local
+
+                    if prev_vpool is not None and prev_true_set is not None:
+                        def old_truth(obj: Tuple[Any, ...]):
+                            """
+                            Return True/False/None for the variable 'obj' in the *old* model:
+                            - True  if it existed and was True,
+                            - False if it existed and was False,
+                            - None  if it did not exist in the old formula.
+                            """
+                            old_vid = prev_vpool.obj2id.get(obj, None)
+                            if old_vid is None:
+                                return None
+                            return (old_vid in prev_true_set)
+
+                        # Build frozen_cell_ion and frozen_ion_pos.
+                        for r in range(freeze_round_start, R):
+                            if freeze_pass_whitelist is not None:
+                                pass_iter = [
+                                    p_idx
+                                    for p_idx in freeze_pass_whitelist
+                                    if 0 <= p_idx <= P_bounds[r]
+                                ]
+                                if not pass_iter:
+                                    continue
+                            else:
+                                P_freeze_eff = max(0, min(P_freeze, P_bounds[r]))
+                                pass_iter = range(P_freeze_eff + 1)
+
+                            for p in pass_iter:
+                                for krow in range(n_core):
+                                    for jcol in range(m_core):
+                                        frozen_ion = None
+                                        for ion in ions:
+                                            if freeze_ions is not None and ion not in freeze_ions:
+                                                continue
+                                            if old_truth(("a", r, p, krow, jcol, ion)):
+                                                frozen_ion = ion
+                                                break
+                                        if frozen_ion is None:
+                                            continue  # no spectator ion was fixed here previously
+                                        if frozen_ion in round_active_ions.get(r, set()):
+                                            if DEBUG_DIAG:
+                                                print(
+                                                    "[FREEZE-BUILD] Skipping gating ion from freeze set: "
+                                                    f"ion={frozen_ion}, r={r}, p={p}, pos=({krow},{jcol})",
+                                                    flush=True,
+                                                )
+                                            continue
+                                        bt_owner = None
+                                        if 0 <= r < len(BT):
+                                            for ion_bt, (d_fix, c_fix) in BT[r].items():
+                                                if d_fix == krow and c_fix == jcol:
+                                                    bt_owner = ion_bt
+                                                    break
+                                        if bt_owner is not None and bt_owner != frozen_ion:
+                                            if DEBUG_DIAG:
+                                                print(
+                                                    "[FREEZE-BUILD] Skipping freeze due to BT cell collision: "
+                                                    f"r={r}, p={p}, cell=({krow},{jcol}), "
+                                                    f"frozen_ion={frozen_ion}, bt_owner={bt_owner}",
+                                                    flush=True,
+                                                )
+                                            continue
+                                        frozen_cell_ion[(r, p, krow, jcol)] = frozen_ion
+                                        frozen_ion_pos[(r, p, frozen_ion)] = (krow, jcol)
+
+                        # Debug sanity: ensure freeze mapping is one-to-one
+                        for (r,p,k,j), ion in frozen_cell_ion.items():
+                            other_ion = frozen_cell_ion.get((r,p,k,j))
+                            assert other_ion == ion  # no other ion in same cell (should hold by dict keys)
+                        for (r,p,ion), pos in frozen_ion_pos.items():
+                            other_pos = frozen_ion_pos.get((r,p,ion))
+                            assert other_pos == pos  # each ion has one frozen position per (r,p)
+
+                        # ------------------------------------------------------------------
+                        # Extra freeze sanity: ensure consistency with old model, BT, P_arr
+                        # ------------------------------------------------------------------
+                        if (
+                            not skip_freeze_sanity
+                            and old_truth is not None
+                            and freeze_mode != FREEZE_NONE
+                        ):
+                            # 1) Every frozen cell must have been TRUE in the old model.
+                            for (r_f, p_f, k_f, j_f), ion_f in frozen_cell_ion.items():
+                                val = old_truth(("a", r_f, p_f, k_f, j_f, ion_f))
+                                if val is not True:
+                                    raise AssertionError(
+                                        "[FREEZE-SANITY] cell freeze inconsistent with old model: "
+                                        f"a(r={r_f},p={p_f},row={k_f},col={j_f},ion={ion_f}) "
+                                        f"was not True previously (val={val!r})"
+                                    )
+
+                            # 2) Every frozen ion-position pair must match the old model.
+                            for (r_f, p_f, ion_f), (k_f, j_f) in frozen_ion_pos.items():
+                                val = old_truth(("a", r_f, p_f, k_f, j_f, ion_f))
+                                if val is not True:
+                                    raise AssertionError(
+                                        "[FREEZE-SANITY] ion-pos freeze inconsistent with old model: "
+                                        f"a(r={r_f},p={p_f},row={k_f},col={j_f},ion={ion_f}) "
+                                        f"was not True previously (val={val!r})"
+                                    )
+
+                            # 3) Do not freeze ions that participate in P_arr[r] for that round.
+                            frozen_round_ions: Dict[int, Set[int]] = {}
+                            for (r_f, _p_f, ion_f), _pos in frozen_ion_pos.items():
+                                frozen_round_ions.setdefault(r_f, set()).add(ion_f)
+
+                            for r_f, ions_f in frozen_round_ions.items():
+                                if 0 <= r_f < len(P_arr):
+                                    active_in_round: Set[int] = set()
+                                    for (i1, i2) in P_arr[r_f]:
+                                        active_in_round.add(i1)
+                                        active_in_round.add(i2)
+                                    bad = ions_f & active_in_round
+                                    if bad:
+                                        raise AssertionError(
+                                            f"[FREEZE-SANITY] ions frozen in r={r_f} but also "
+                                            f"in P_arr[{r_f}]: {sorted(bad)}"
+                                        )
+
+                            # 4) Freeze vs BT consistency: if an ion is frozen and BT-pinned in the
+                            #    same round, their positions must agree (freeze -> BT, but not BT -> freeze).
+                            def _bt_pos_for(r_idx: int, ion_idx: int):
+                                if 0 <= r_idx < len(BT):
+                                    return BT[r_idx].get(ion_idx)
+                                return None
+
+                            for (r_f, p_f, ion_f), (k_f, j_f) in list(frozen_ion_pos.items()):
+                                bt_pos = _bt_pos_for(r_f, ion_f)
+                                if bt_pos is not None:
+                                    row_bt, col_bt = bt_pos
+                                    if (row_bt, col_bt) != (k_f, j_f):
+                                        if DEBUG_DIAG:
+                                            print(
+                                                "[FREEZE-SANITY] Mismatch; dropping frozen ion: "
+                                                f"ion={ion_f}, r={r_f}, p={p_f}, freeze_pos=({k_f},{j_f}), "
+                                                f"BT_pos=({row_bt},{col_bt})",
+                                                flush=True,
+                                            )
+                                        frozen_ion_pos.pop((r_f, p_f, ion_f), None)
+                                        frozen_cell_ion.pop((r_f, p_f, k_f, j_f), None)
+                                        continue
+
+                            for (r_f, p_f, k_f, j_f), ion_f in list(frozen_cell_ion.items()):
+                                bt_pos = _bt_pos_for(r_f, ion_f)
+                                if bt_pos is not None:
+                                    row_bt, col_bt = bt_pos
+                                    if (row_bt, col_bt) != (k_f, j_f):
+                                        if DEBUG_DIAG:
+                                            print(
+                                                "[FREEZE-SANITY] Cell mismatch; dropping frozen cell: "
+                                                f"ion={ion_f}, r={r_f}, p={p_f}, cell=({k_f},{j_f}), "
+                                                f"BT_pos=({row_bt},{col_bt})",
+                                                flush=True,
+                                            )
+                                        frozen_cell_ion.pop((r_f, p_f, k_f, j_f), None)
+
+
+            # ---------------------------------------------
+            # Identify ions that are frozen anywhere in a round
+            # ---------------------------------------------
+            end_frozen_ion: Dict[Tuple[int, int], bool] = {}
+
+            if (
+                old_truth is not None
+                and freeze_mode != FREEZE_NONE
+                and n_core > 0
+                and m_core > 0
+                and P_freeze > 0
+            ):
+                for r in range(R):
+                    for ion in ions:
+                        end_frozen_ion[(r, ion)] = False
+
+                for (r_f, _p_f, ion_f), _pos in frozen_ion_pos.items():
+                    if 0 <= r_f < R and ion_f in ions:
+                        end_frozen_ion[(r_f, ion_f)] = True
+            else:
+                for r in range(R):
+                    for ion in ions:
+                        end_frozen_ion[(r, ion)] = False
 
             # ------------------------------------------------------------------
             # (0) Global permutation: exactly one ion per cell AND each ion in exactly one cell
             # ------------------------------------------------------------------
+            if not debug_skip_cardinality:
+                # (0a) Exactly one ion per cell (r,p,k,j), frozen-aware
+                for r in range(R):
+                    g_cell = f"CARD_CELL:r{r}"
+                    for p in range(P_bounds[r] + 1):
+                        g_cell_freeze = f"CARD_CELL_FREEZE:r{r}:p{p}"
+                        for krow in range(n):
+                            for jcol in range(m):
+                                key = (r, p, krow, jcol)
+                                if key in frozen_cell_ion and old_truth is not None:
+                                    ion0 = frozen_cell_ion[key]
+                                    add_hard(
+                                        [var_a(r, p, krow, jcol, ion0)],
+                                        g_cell_freeze,
+                                        meta={
+                                            "kind": "freeze_cell_unit",
+                                            "r": r,
+                                            "p": p,
+                                            "row": krow,
+                                            "col": jcol,
+                                            "ion": ion0,
+                                        },
+                                    )
+                                    for ion in ions:
+                                        if ion != ion0:
+                                            add_hard(
+                                                [-var_a(r, p, krow, jcol, ion)],
+                                                g_cell_freeze,
+                                                meta={
+                                                    "kind": "freeze_cell_exclude",
+                                                    "r": r,
+                                                    "p": p,
+                                                    "row": krow,
+                                                    "col": jcol,
+                                                    "ion": ion,
+                                                    "ion0": ion0,
+                                                },
+                                            )
+                                    continue
 
-            # (0a) Exactly one ion per cell (r,p,k,j)
-            for r in range(R):
-                for p in range(P_bound + 1):
-                    for krow in range(n):
-                        for jcol in range(m):
-                            lits = [var_a(r, p, krow, jcol, ion) for ion in ions]
-                            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                            for cl in enc.clauses:
-                                add_clause(cl)
+                                lits = [var_a(r, p, krow, jcol, ion) for ion in ions]
+                                enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+                                for cl in enc.clauses:
+                                    add_hard(cl, g_cell)
 
-            # Final state r = R, p = 0: also exactly-one per cell
-            for krow in range(n):
-                for jcol in range(m):
-                    lits = [var_a(R, 0, krow, jcol, ion) for ion in ions]
-                    enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                    for cl in enc.clauses:
-                        add_clause(cl)
-
-            # (0b) Each ion occupies exactly one cell (k,j) at every (r,p)
-            for r in range(R):
-                for p in range(P_bound + 1):
-                    for ion in ions:
-                        lits = [var_a(r, p, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
+                g_cell_final = "CARD_CELL:FINAL"
+                for krow in range(n):
+                    for jcol in range(m):
+                        lits = [var_a(R, 0, krow, jcol, ion) for ion in ions]
                         enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
                         for cl in enc.clauses:
-                            add_clause(cl)
+                            add_hard(cl, g_cell_final)
 
-            # final state r=R, p=0 also: each ion in exactly one cell
-            for ion in ions:
-                lits = [var_a(R, 0, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
-                enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                for cl in enc.clauses:
-                    add_clause(cl)
+                # (0b) Each ion occupies exactly one cell (k,j) at every (r,p), frozen-aware
+                for r in range(R):
+                    g_ion_r = f"CARD_ION:r{r}"
+                    for p in range(P_bounds[r] + 1):
+                        g_ion_freeze = f"CARD_ION_FREEZE:r{r}:p{p}"
+                        for ion in ions:
+                            key_ion = (r, p, ion)
+                            if key_ion in frozen_ion_pos and old_truth is not None:
+                                k_fix, j_fix = frozen_ion_pos[key_ion]
+                                for krow in range(n):
+                                    for jcol in range(m):
+                                        if (krow == k_fix and jcol == j_fix):
+                                            continue
+                                        add_hard(
+                                            [-var_a(r, p, krow, jcol, ion)],
+                                            g_ion_freeze,
+                                            meta={
+                                                "kind": "freeze_ion_pos",
+                                                "r": r,
+                                                "p": p,
+                                                "ion": ion,
+                                                "row": krow,
+                                                "col": jcol,
+                                                "fixed_row": k_fix,
+                                                "fixed_col": j_fix,
+                                            },
+                                        )
+                                continue
+
+                            lits = [var_a(r, p, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
+                            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+                            for cl in enc.clauses:
+                                add_hard(cl, g_ion_r)
+
+                g_ion_final = "CARD_ION:FINAL"
+                for ion in ions:
+                    lits = [var_a(R, 0, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
+                    enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+                    for cl in enc.clauses:
+                        add_hard(cl, g_ion_final)
 
             # ------------------------------------------------------------------
             # (1) Initial layout and inter-round chaining
@@ -1634,21 +2010,29 @@ class GlobalReconfigurations(Operation):
                 for jcol in range(m):
                     ion0 = int(A_in[krow, jcol])
                     # Ion ion0 must be there
-                    add_clause([var_a(0, 0, krow, jcol, ion0)])
+                    add_hard([var_a(0, 0, krow, jcol, ion0)], "INIT")
                     # No other ion may be there at (0,0)
                     for ion in ions:
                         if ion != ion0:
-                            add_clause([-var_a(0, 0, krow, jcol, ion)])
+                            add_hard([-var_a(0, 0, krow, jcol, ion)], "INIT")
 
-            # (1b) Chaining: a[r+1,0] <-> a[r,P_bound] for r=0..R-1
+            # (1b) Chaining: a[r+1,0] <-> a[r,P_bounds[r]] for r=0..R-1
             for r in range(R):
+                g_chain_r = f"CHAIN:r{r}"
                 for krow in range(n):
                     for jcol in range(m):
+                        key_next_cell = (r + 1, 0, krow, jcol)
+
+                        # If start-of-next-round cell is frozen, don't chain it:
+                        # its value is dictated by the freeze, not by round-r end layout.
+                        if old_truth is not None and key_next_cell in frozen_cell_ion:
+                            continue  # skip all ions for this (r+1,0,krow,jcol)
+
                         for ion in ions:
                             a_next = var_a(r + 1, 0, krow, jcol, ion)
-                            a_end = var_a(r, P_bound, krow, jcol, ion)
-                            add_clause([-a_next, a_end])
-                            add_clause([-a_end, a_next])
+                            a_end  = var_a(r, P_bounds[r], krow, jcol, ion)
+                            add_hard([-a_next, a_end], g_chain_r)
+                            add_hard([-a_end, a_next], g_chain_r)
 
             # ------------------------------------------------------------------
             # (2) BT pinning at end-of-round (FINAL STATE ONLY)
@@ -1659,29 +2043,31 @@ class GlobalReconfigurations(Operation):
                     if is_reserved(r, ion):
                         d_fix, c_fix = BT[r][ion]
                         # Ion must occupy (d_fix,c_fix) at end-of-round r
-                        add_clause([var_a(r, P_bound, d_fix, c_fix, ion)])
+                        add_hard([var_a(r, P_bounds[r], d_fix, c_fix, ion)], "BT")
                         # Ion cannot be anywhere else at end-of-round r
                         for krow in range(n):
                             for jcol in range(m):
                                 if (krow, jcol) != (d_fix, c_fix):
-                                    add_clause([-var_a(r, P_bound, krow, jcol, ion)])
+                                    add_hard([-var_a(r, P_bounds[r], krow, jcol, ion)], "BT")
 
             # ------------------------------------------------------------------
             # (3) Phase structure: horizontal -> vertical
             # ------------------------------------------------------------------
 
-            # (3a) Monotonicity: phase[p] -> phase[p+1], unless debug_allow_phase_flips
-            if not debug_allow_phase_flips and P_bound > 1:
-                for p in range(P_bound - 1):
-                    add_clause([-var_phase(p), var_phase(p + 1)])
+            # (3a) Monotonicity: phase[r,p] -> phase[r,p+1] for each round r
+            if not debug_allow_phase_flips:
+                for r in range(R):
+                    if P_bounds[r] > 1:
+                        for p in range(P_bounds[r] - 1):
+                            add_hard([-var_phase(r, p), var_phase(r, p + 1)], "PHASE_MONO")
 
             # ------------------------------------------------------------------
             # (4) Horizontal and (5) Vertical comparators + semantics + copy constraints
             # ------------------------------------------------------------------
 
             for r in range(R):
-                for p in range(P_bound):
-                    phase_p = var_phase(p)
+                for p in range(P_bounds[r]):
+                    phase_p = var_phase(r,p)
 
                     # ---------------- Horizontal comparators (row-wise) ----------------
                     for krow in range(n):
@@ -1690,31 +2076,31 @@ class GlobalReconfigurations(Operation):
 
                             # Gating: if phase[p] = 1 (vertical), horizontal comparators must be off
                             # phase[p] = 1 ⇒ ¬s_h  ==  (¬phase[p] ∨ ¬s_h)
-                            add_clause([-phase_p, -sh])
+                            add_hard([-phase_p, -sh], "H_GATE")
 
                             # Parity (odd-even) for horizontal comparisons:
                             # here we just use p%2 as horizontal parity:
                             #   if jcol % 2 != p % 2 then s_h must be 0
                             if jcol % 2 != (p % 2):
-                                add_clause([-sh])
+                                add_hard([-sh], "H_GATE")
 
                             # Forward-only SWAP semantics between (krow,jcol) and (krow,jcol+1)
                             # NOTE: we ONLY constrain the s=1 (swap) case here.
                             #       The s=0 (identity) case is handled by the horizontal copy
                             #       constraints below, which are guarded on ¬phase and ¬s_left/¬s_right.
                             for ion in ions:
-                                a_cur_j  = var_a(r, p,     krow, jcol,     ion)
-                                a_cur_j1 = var_a(r, p,     krow, jcol + 1, ion)
-                                a_next_j  = var_a(r, p + 1, krow, jcol,     ion)
+                                a_cur_j = var_a(r, p, krow, jcol, ion)
+                                a_cur_j1 = var_a(r, p, krow, jcol + 1, ion)
+                                a_next_j = var_a(r, p + 1, krow, jcol, ion)
                                 a_next_j1 = var_a(r, p + 1, krow, jcol + 1, ion)
 
                                 # (H3) If s=1 and ion is in right cell at p, it must be in left at p+1:
                                 #      (s ∧ a_cur_j1) -> a_next_j
-                                add_clause([-sh, -a_cur_j1, a_next_j])
+                                add_hard([-sh, -a_cur_j1, a_next_j], "H_SEM")
 
                                 # (H4) If s=1 and ion is in left cell at p, it must be in right at p+1:
                                 #      (s ∧ a_cur_j) -> a_next_j1
-                                add_clause([-sh, -a_cur_j,  a_next_j1])
+                                add_hard([-sh, -a_cur_j, a_next_j1], "H_SEM")
 
                     # ---------------- Vertical comparators (column-wise) ----------------
                     for krow in range(n - 1):
@@ -1723,48 +2109,39 @@ class GlobalReconfigurations(Operation):
 
                             # Gating: if phase[p] = 0 (horizontal), vertical comparators must be off
                             # phase[p] = 0 ⇒ ¬s_v  ==  (phase[p] ∨ ¬s_v)
-                            add_clause([phase_p, -sv])
+                            add_hard([phase_p, -sv], "V_GATE")
 
                             # Parity (odd-even) for vertical comparisons, using p%2 as v-index:
                             #   if krow % 2 != p % 2 then s_v must be 0
                             if krow % 2 != (p % 2):
-                                add_clause([-sv])
+                                add_hard([-sv], "V_GATE")
 
                             # Forward-only SWAP semantics between (krow,jcol) and (krow+1,jcol)
                             # Again, ONLY the s=1 case is constrained here; s=0 is enforced by
                             # the vertical copy constraints (phase ∧ ¬s_up ∧ ¬s_down).
                             for ion in ions:
-                                a_cur_top  = var_a(r, p,     krow,     jcol, ion)
-                                a_cur_bot  = var_a(r, p,     krow + 1, jcol, ion)
-                                a_next_top = var_a(r, p + 1, krow,     jcol, ion)
+                                a_cur_top = var_a(r, p, krow, jcol, ion)
+                                a_cur_bot = var_a(r, p, krow + 1, jcol, ion)
+                                a_next_top = var_a(r, p + 1, krow, jcol, ion)
                                 a_next_bot = var_a(r, p + 1, krow + 1, jcol, ion)
 
                                 # (V3) If s=1 and ion is in bottom cell at p, it must be in top at p+1:
                                 #      (s ∧ a_cur_bot) -> a_next_top
-                                add_clause([-sv, -a_cur_bot, a_next_top])
+                                add_hard([-sv, -a_cur_bot, a_next_top], "V_SEM")
 
                                 # (V4) If s=1 and ion is in top cell at p, it must be in bottom at p+1:
                                 #      (s ∧ a_cur_top) -> a_next_bot
-                                add_clause([-sv, -a_cur_top, a_next_bot])
+                                add_hard([-sv, -a_cur_top, a_next_bot], "V_SEM")
 
             # -------- Copy constraints for non-participating cells (horizontal phase) --------
-            #
-            # For each (r,p,k,j,i), if phase[p]=0 (horizontal) AND no horizontal comparator
-            # incident on (k,j) is active (i.e., s_h left/right both false), then:
-            #   a[r,p,k,j,i] ↔ a[r,p+1,k,j,i]
-            #
-            # Implemented as implications guarded by (¬phase[p] ∧ ¬s_left ∧ ¬s_right).
-            # This includes endpoints with s_h=0; if a comparator is active (s_h=1),
-            # these copy constraints are disabled and the swap semantics above apply.
-
             for r in range(R):
-                for p in range(P_bound):
-                    phase_p = var_phase(p)
+                for p in range(P_bounds[r]):
+                    phase_p = var_phase(r,p)
                     for krow in range(n):
                         for jcol in range(m):
                             # horizontal comparators that touch (krow,jcol)
-                            s_left  = var_s_h(r, p, krow, jcol - 1) if jcol > 0     else None
-                            s_right = var_s_h(r, p, krow, jcol)     if jcol < m - 1 else None
+                            s_left = var_s_h(r, p, krow, jcol - 1) if jcol > 0 else None
+                            s_right = var_s_h(r, p, krow, jcol) if jcol < m - 1 else None
 
                             # antecedent: (¬phase[p] ∧ ¬s_left ∧ ¬s_right)
                             lits_ante_neg = [phase_p]  # this is ¬(¬phase), used on the clause side
@@ -1775,36 +2152,26 @@ class GlobalReconfigurations(Operation):
                                 lits_ante_neg.append(s_right)
 
                             for ion in ions:
-                                a_cur  = var_a(r, p,     krow, jcol, ion)
+                                a_cur = var_a(r, p, krow, jcol, ion)
                                 a_next = var_a(r, p + 1, krow, jcol, ion)
 
                                 # (¬phase ∧ ¬s_left ∧ ¬s_right ∧ a_cur) -> a_next
                                 # CNF: (phase ∨ s_left ∨ s_right ∨ ¬a_cur ∨ a_next)
-                                add_clause(lits_ante_neg + [-a_cur, a_next])
+                                add_hard(lits_ante_neg + [-a_cur, a_next], "H_COPY")
 
                                 # (¬phase ∧ ¬s_left ∧ ¬s_right ∧ a_next) -> a_cur
                                 # CNF: (phase ∨ s_left ∨ s_right ∨ ¬a_next ∨ a_cur)
-                                add_clause(lits_ante_neg + [-a_next, a_cur])
+                                add_hard(lits_ante_neg + [-a_next, a_cur], "H_COPY")
 
             # -------- Copy constraints for non-participating cells (vertical phase) --------
-            #
-            # For each (r,p,k,j,i), if phase[p]=1 (vertical) AND no vertical comparator
-            # incident on (k,j) is active (i.e., s_v up/down both false), then:
-            #   a[r,p,k,j,i] ↔ a[r,p+1,k,j,i]
-            #
-            # Implemented as implications guarded by (phase[p] ∧ ¬s_up ∧ ¬s_down).
-            # As above, this includes endpoints with s_v=0; if a comparator is active
-            # at this cell, these copy constraints are disabled and the vertical swap
-            # semantics take over.
-
             for r in range(R):
-                for p in range(P_bound):
-                    phase_p = var_phase(p)
+                for p in range(P_bounds[r]):
+                    phase_p = var_phase(r,p)
                     for krow in range(n):
                         for jcol in range(m):
                             # vertical comparators that touch (krow,jcol)
-                            s_up   = var_s_v(r, p, krow - 1, jcol) if krow > 0     else None
-                            s_down = var_s_v(r, p, krow,     jcol) if krow < n - 1 else None
+                            s_up = var_s_v(r, p, krow - 1, jcol) if krow > 0 else None
+                            s_down = var_s_v(r, p, krow, jcol) if krow < n - 1 else None
 
                             # antecedent: (phase[p] ∧ ¬s_up ∧ ¬s_down)
                             lits_ante_neg = [-phase_p]  # this is ¬phase on the clause side
@@ -1815,66 +2182,82 @@ class GlobalReconfigurations(Operation):
                                 lits_ante_neg.append(s_down)
 
                             for ion in ions:
-                                a_cur  = var_a(r, p,     krow, jcol, ion)
+                                a_cur = var_a(r, p, krow, jcol, ion)
                                 a_next = var_a(r, p + 1, krow, jcol, ion)
 
                                 # (phase ∧ ¬s_up ∧ ¬s_down ∧ a_cur) -> a_next
                                 # CNF: (¬phase ∨ s_up ∨ s_down ∨ ¬a_cur ∨ a_next)
-                                add_clause(lits_ante_neg + [-a_cur, a_next])
+                                add_hard(lits_ante_neg + [-a_cur, a_next], "V_COPY")
 
                                 # (phase ∧ ¬s_up ∧ ¬s_down ∧ a_next) -> a_cur
                                 # CNF: (¬phase ∨ s_up ∨ s_down ∨ ¬a_next ∨ a_cur)
-                                add_clause(lits_ante_neg + [-a_next, a_cur])
+                                add_hard(lits_ante_neg + [-a_next, a_cur], "V_COPY")
 
             # ------------------------------------------------------------------
             # (5) End-of-round row/block abstraction and pair constraints
             # ------------------------------------------------------------------
 
             for r in range(R):
-                # row_end / w_end linkage from final layout a[r,P_bound]
+                g_rb_r = f"ROWBLOCK_LINK:r{r}"
+                g_pair_r = f"PAIR_REQ:r{r}"
+
+                # row_end / w_end linkage from final layout a[r,P_bounds[r]]
                 for ion in ions:
+                    # If this ion's end-of-round position is fully frozen inside
+                    # the core, we do not re-impose row/block abstraction for it
+                    # in this solve; its behaviour comes from the frozen model.
+                    if end_frozen_ion.get((r, ion), False):
+                        continue
+
                     # row_end
                     for d in range(n):
                         re = var_row_end(r, ion, d)
-                        cell_lits = [var_a(r, P_bound, d, j, ion) for j in range(m)]
-                        # row_end -> OR a
-                        add_clause([-re] + cell_lits)
-                        # each cell -> row_end
+                        cell_lits = [var_a(r, P_bounds[r], d, j, ion) for j in range(m)]
+                        add_hard([-re] + cell_lits, g_rb_r)
                         for aj in cell_lits:
-                            add_clause([-aj, re])
+                            add_hard([-aj, re], g_rb_r)
 
                     # w_end
                     for b in range(num_blocks):
                         we = var_w_end(r, ion, b)
-                        cells = []
+                        cells: List[int] = []
                         for d in range(n):
-                            for j in range(b * k, min((b + 1) * k, m)):
-                                cells.append(var_a(r, P_bound, d, j, ion))
+                            for j in range(b * CAPACITY, min((b + 1) * CAPACITY, m)):
+                                cells.append(var_a(r, P_bounds[r], d, j, ion))
                         if cells:
-                            add_clause([-we] + cells)
+                            add_hard([-we] + cells, g_rb_r)
                             for aj in cells:
-                                add_clause([-aj, we])
+                                add_hard([-aj, we], g_rb_r)
                         else:
-                            # Block has no columns (edge case), force w_end false
-                            add_clause([-we])
+                            add_hard([-we], g_rb_r)
 
                 # Pairs must share same row and block (unless skipping for debug)
                 if not debug_skip_pair_constraints:
-                    for (i1, i2) in P_arr[r]:
-                        if i1 not in ions or i2 not in ions:
-                            continue
-                        # Same row
-                        for d in range(n):
-                            re1 = var_row_end(r, i1, d)
-                            re2 = var_row_end(r, i2, d)
-                            add_clause([-re1, re2])
-                            add_clause([-re2, re1])
-                        # Same block
-                        for b in range(num_blocks):
-                            we1 = var_w_end(r, i1, b)
-                            we2 = var_w_end(r, i2, b)
-                            add_clause([-we1, we2])
-                            add_clause([-we2, we1])
+                    if r in disable_pairs_rounds:
+                        pass
+                    else:
+                        for (i1, i2) in P_arr[r]:
+                            if i1 not in ions or i2 not in ions:
+                                continue
+
+                            # If either ion's end-of-round position is frozen
+                            # in this round, treat this pair as already handled
+                            # by the frozen model and skip re-imposing equality.
+                            if end_frozen_ion.get((r, i1), False) or end_frozen_ion.get((r, i2), False):
+                                continue
+
+                            # Same row
+                            for d in range(n):
+                                re1 = var_row_end(r, i1, d)
+                                re2 = var_row_end(r, i2, d)
+                                add_hard([-re1, re2], g_pair_r)
+                                add_hard([-re2, re1], g_pair_r)
+                            # Same block
+                            for b in range(num_blocks):
+                                we1 = var_w_end(r, i1, b)
+                                we2 = var_w_end(r, i2, b)
+                                add_hard([-we1, we2], g_pair_r)
+                                add_hard([-we2, we1], g_pair_r)
 
             # ------------------------------------------------------------------
             # (6) Optional Level-3 soft clauses (boundary avoidance, swap-cost)
@@ -1895,7 +2278,7 @@ class GlobalReconfigurations(Operation):
                 for r in range(R):
                     for ion in ions:
                         in_minor = ion_in_minor_P_arr(r, ion)   # gate in this subgrid
-                        in_full  = ion_in_full_P_arr(r, ion)    # gate somewhere (this or later)
+                        in_full = ion_in_full_P_arr(r, ion)     # gate somewhere (this or later)
 
                         # If ion never participates in any gate, don't care about its boundary placement.
                         if not in_minor and not in_full:
@@ -1906,164 +2289,90 @@ class GlobalReconfigurations(Operation):
                         #         → avoid putting it on the boundary at end-of-round.
                         # --------------------------------------------------------------
                         if in_minor:
-                            lits_avoid = []
-
                             if wB_col > 0:
                                 # Avoid last-column cells.
                                 for d, jcol in boundary_cells:
                                     if jcol == m - 1:
-                                        # Cost if ion is TRUE in a boundary cell:
-                                        # clause is OR of negative literals, so violation = ion at boundary.
-                                        add_soft_clause([-var_a(r, P_bound, d, jcol, ion)], weight=wB_col)
+                                        add_soft(
+                                            [-var_a(r, P_bounds[r], d, jcol, ion)],
+                                            weight=wB_col,
+                                        )
 
                             if wB_row > 0:
                                 # Avoid last-row cells.
                                 for d, jcol in boundary_cells:
                                     if d == n - 1:
-                                        add_soft_clause([-var_a(r, P_bound, d, jcol, ion)], weight=wB_row)
-
-                            # if lits_avoid:
-                            #     # Clause satisfied (no cost) if ion stays out of all boundary cells.
-                            #     # Violated (cost) if ion is placed on any boundary cell.
-                            #     add_clause(lits_avoid)
+                                        add_soft(
+                                            [-var_a(r, P_bounds[r], d, jcol, ion)],
+                                            weight=wB_row,
+                                        )
 
                         # --------------------------------------------------------------
                         # Case 2: ion has no gate in this subgrid but has gates elsewhere
                         #         → mildly attract it toward the boundary for future routing.
                         # --------------------------------------------------------------
                         elif in_full:
-                            lits_pref = [var_a(r, P_bound, d, jcol, ion)
-                                        for (d, jcol) in boundary_cells]
+                            lits_pref = [
+                                var_a(r, P_bounds[r], d, jcol, ion)
+                                for (d, jcol) in boundary_cells
+                            ]
 
                             if lits_pref:
                                 # Clause satisfied (no cost) if ion is TRUE in *some* boundary cell.
                                 # Violated (cost) if ion is interior-only.
-                                add_soft_clause(lits_pref, weight=min(wB_col, wB_row))
+                                add_soft(
+                                    lits_pref,
+                                    weight=min(wB_col if wB_col > 0 else wB_row,
+                                               wB_row if wB_row > 0 else wB_col),
+                                )
 
+            # -------------------------------
+            # Per-round pass usage helpers (u) and global Σ_r P_r bound
+            # -------------------------------
+            # Keep u[r,p] as-is: u <-> (OR of comparators)
+            for r in range(R):
+                for p in range(P_bounds[r]):
+                    u_rp = var_u(r, p)
 
-                # Swap-cost minimisation: penalise s_h and s_v being True
-                # swap_weight = 1
-                # if "wSwap" in globals():
-                #     swap_weight = globals()["wSwap"]
-                # if "wSwap" in locals():
-                #     swap_weight = locals()["wSwap"]
+                    comp_lits: List[int] = []
+                    for krow in range(n):
+                        for jcol in range(m - 1):
+                            comp_lits.append(var_s_h(r, p, krow, jcol))
+                    for krow in range(n - 1):
+                        for jcol in range(m):
+                            comp_lits.append(var_s_v(r, p, krow, jcol))
 
-                # for r in range(R):
-                #     for p in range(P_bound):
-                #         for krow in range(n):
-                #             for jcol in range(m - 1):
-                #                 add_soft_clause([-var_s_h(r, p, krow, jcol)], weight=swap_weight)
-                #         for krow in range(n - 1):
-                #             for jcol in range(m):
-                #                 add_soft_clause([-var_s_v(r, p, krow, jcol)], weight=swap_weight)
+                    if not comp_lits:
+                        # No comparators exist at all in this pass: u must be false.
+                        add_hard([-u_rp], "UTIL_U")
+                        continue
 
-   
- 
+                    # u[r,p] ↔ OR(comp_lits)
+                    add_hard([-u_rp] + comp_lits, "UTIL_U")
+                    for s_lit in comp_lits:
+                        add_hard([-s_lit, u_rp], "UTIL_U")
 
-            
-            # ------------------------------------------------------------------
-            # (7) Frozen-core constraints for subgrid growth (optional)
-            # ------------------------------------------------------------------
-            if freeze_params is not None:
-                mode = freeze_params.get("mode", FREEZE_NONE)
-                if mode != FREEZE_NONE:
-                    n_core = min(freeze_params.get("n_core", 0), n)
-                    m_core = min(freeze_params.get("m_core", 0), m)
-                    P_freeze = min(freeze_params.get("P_freeze", 0), P_bound)
-                    P_freeze_max = freeze_params.get("P_freeze_max", 0)
-                    prev_vpool = freeze_params.get("prev_vpool", None)
-                    prev_true_set = freeze_params.get("prev_true_set", None)
+            if sum_bound_B is not None and optimize_round_start < R:
+                sum_u_lits: List[int] = []
+                for r in range(optimize_round_start, R):
+                    for p in range(P_bounds[r]):
+                        sum_u_lits.append(var_u(r, p))
 
-                    if prev_vpool is not None and prev_true_set is not None:
-                        def old_truth(obj: Tuple[Any, ...]):
-                            """
-                            Return True/False/None for the variable 'obj' in the *old* model:
-                            - True  if it existed and was True,
-                            - False if it existed and was False,
-                            - None  if it did not exist in the old formula.
-                            """
-                            old_vid = prev_vpool.obj2id.get(obj, None)
-                            if old_vid is None:
-                                return None
-                            return (old_vid in prev_true_set)
+                total_slots = len(sum_u_lits)
+                bound = min(sum_bound_B, total_slots)
+                if bound < total_slots:
+                    card_enc = CardEnc.atmost(
+                        lits=sum_u_lits,
+                        bound=bound,
+                        encoding=EncType.totalizer,
+                        vpool=vpool,
+                    )
+                    for clause in card_enc.clauses:
+                        add_hard(clause, "SUM_BOUND")
 
-                        # --- Freeze 'a' only where they were True ---
-                        for r in range(R):
-                            for p in range(P_freeze + 1):
-                                for krow in range(n_core):
-                                    for jcol in range(m_core):
-                                        for ion in ions:
-                                            old_val = old_truth(("a", r, p, krow, jcol, ion))
-                                            if old_val is True:
-                                                # Pin this ion at this cell/time
-                                                add_clause([var_a(r, p, krow, jcol, ion)])
-                                            # if old_val is False or None, do nothing; 
-                                            # cardinalities + other pins will constrain them.
-                            # if P_freeze_max>0 and P_freeze_max>P_freeze:
-                            #     for krow in range(n_core):
-                            #         for jcol in range(m_core):
-                            #             for ion in ions:
-                            #                 old_val = old_truth(("a", r, P_freeze_max, krow, jcol, ion))
-                            #                 if old_val is True:
-                            #                     # Pin this ion at this cell/time
-                            #                     add_clause([var_a(r, p, krow, jcol, ion)])
-                            #                 # if old_val is False or None, do nothing; 
-                            #                 # cardinalities + other pins will constrain them.
-                        
-
-                        if mode == FREEZE_FULL:
-                            # Freeze horizontal comparators in core for passes p < P_freeze
-                            for r in range(R):
-                                for p in range(P_freeze):
-                                    for krow in range(n_core):
-                                        for jcol in range(max(0, m_core - 1)):
-                                            old_val = old_truth(("s_h", r, p, krow, jcol))
-                                            if old_val is None:
-                                                continue
-                                            new_var = var_s_h(r, p, krow, jcol)
-                                            if old_val:
-                                                add_clause([new_var])
-                                       
-
-                            # Freeze vertical comparators in core for passes p < P_freeze
-                            for r in range(R):
-                                for p in range(P_freeze):
-                                    for krow in range(max(0, n_core - 1)):
-                                        for jcol in range(m_core):
-                                            old_val = old_truth(("s_v", r, p, krow, jcol))
-                                            if old_val is None:
-                                                continue
-                                            new_var = var_s_v(r, p, krow, jcol)
-                                            if old_val:
-                                                add_clause([new_var])
-                               
-
-                            # Freeze phase[p] bits for p < P_freeze
-                            for p in range(P_freeze):
-                                old_val = old_truth(("phase", p))
-                                if old_val is None:
-                                    continue
-                                new_phase = var_phase(p)
-                                if old_val:
-                                    add_clause([new_phase])
-                            
-
-
-
-            # if DEBUG_DIAG_DETAILED and use_wcnf:
-            #     print(
-            #         f"[WISE] build_structural_cnf({phase_label}) stats: "
-            #         f"vars={vpool.top}, hard={len(formula.hard)}, soft={len(formula.soft)}",
-            #         flush=True,
-            #     )
-            # elif DEBUG_DIAG_DETAILED and not use_wcnf:
-            #     print(
-            #         f"[WISE] build_structural_cnf({phase_label}) stats: "
-            #         f"vars={vpool.top}, hard={len(formula.clauses)}, soft=0",
-            #         flush=True,
-            #     )
-
-            return formula, vpool, ions, var_a
+            selectors = grp.sel if grp.enabled else {}
+            group_meta = grp.meta if grp.enabled else {}
+            return formula, vpool, ions, var_a, selectors, group_meta
      
 
         def decode_wise_schedule_from_model(
@@ -2086,6 +2395,7 @@ class GlobalReconfigurations(Operation):
                     }
             """
             model_set = {lit for lit in model if lit > 0}
+            P_bounds = ([P_bound+n+m]*int(ignore_initial_reconfig) + [P_bound]*(R-int(ignore_initial_reconfig)))
 
             def lit_true(v: int) -> bool:
                 return v in model_set
@@ -2096,13 +2406,13 @@ class GlobalReconfigurations(Operation):
             def var_s_v(r, p, krow, jcol):
                 return vpool.id(("s_v", r, p, krow, jcol))
 
-            def var_phase(p):
-                return vpool.id(("phase", p))
+            def var_phase(r, p):
+                return vpool.id(("phase", r, p))
 
             schedule: List[List[Dict[str, Any]]] = [[] for _ in range(R)]
             for r in range(R):
-                for p in range(P_bound):
-                    phase_lit = var_phase(p)
+                for p in range(P_bounds[r]):
+                    phase_lit = var_phase(r, p)
                     is_vertical = (phase_lit <= vpool.top and lit_true(phase_lit))
                     phase = "V" if is_vertical else "H"
 
@@ -2130,6 +2440,27 @@ class GlobalReconfigurations(Operation):
                     schedule[r].append(pass_info)
 
             return schedule
+
+        def extract_round_pass_usage(model, vpool, R, P_bound):
+            model_set = {lit for lit in model if lit > 0}
+            P_bounds = ([P_bound+n+m]*int(ignore_initial_reconfig) + [P_bound]*(R-int(ignore_initial_reconfig)))
+
+            def lit_true(v: int) -> bool:
+                return v in model_set
+
+            def var_u(r, p):
+                return vpool.id(("u", r, p))
+
+            per_round: List[int] = []
+            for r in range(R):
+                count = 0
+                for p in range(P_bounds[r]):
+                    u_lit = var_u(r, p)
+                    if u_lit <= vpool.top and lit_true(u_lit):
+                        count += 1
+                per_round.append(count)
+
+            return per_round
 
         def wise_debug_boundary_stats(
             label: str,
@@ -2263,6 +2594,42 @@ class GlobalReconfigurations(Operation):
 
             return summary
 
+        def wise_debug_freeze_sanity(
+            label: str,
+            freeze_params: Optional[Dict[str, Any]],
+            P_bound: int,
+        ) -> None:
+            if freeze_params is None:
+                return
+            try:
+                cnf_dbg, vpool_dbg, _, _, _, _ = _build_structural_cnf(
+                    P_bound=P_bound,
+                    sum_bound_B=None,
+                    use_wcnf=False,
+                    add_boundary_soft=False,
+                    phase_label=f"freeze-check:{label}",
+                    debug_skip_pair_constraints=True,
+                    debug_allow_phase_flips=True,
+                    freeze_params=freeze_params,
+                    skip_freeze_sanity=True,
+                    optimize_round_start=0,
+                )
+            except Exception as e:
+                print(
+                    f"[WISE-DEBUG] freeze sanity {label}: error {e}",
+                    flush=True,
+                )
+                return
+
+            with Minisat22(bootstrap_with=cnf_dbg.clauses) as sat:
+                sat_ok = sat.solve()
+
+            print(
+                f"[WISE-DEBUG] freeze sanity {label}: SAT={sat_ok}, "
+                f"vars={vpool_dbg.top}, clauses={len(cnf_dbg.clauses)}",
+                flush=True,
+            )
+
         
 
         if freeze_seed_prev is not None:
@@ -2271,11 +2638,13 @@ class GlobalReconfigurations(Operation):
             prev_P_star = freeze_seed_prev["P_freeze0"]
             prev_vpool = freeze_seed_prev["prev_vpool"]
             prev_model = list(freeze_seed_prev["prev_true_set"])
+            P_freeze_min = freeze_seed_prev["P_freeze_min"]
+            freeze_passes_prev = freeze_seed_prev.get("freeze_passes")
         else:
-            n_core0 = m_core0 = P_freeze0 = 0
+            n_core0 = m_core0 = prev_P_star = P_freeze_min = 0
             prev_vpool = None
             prev_model = None
-            prev_P_star = 0
+            freeze_passes_prev = None
         prev_true_set: Optional[Set[int]] = None
         if prev_model is not None:
             prev_true_set = {lit for lit in prev_model if lit > 0}
@@ -2283,21 +2652,22 @@ class GlobalReconfigurations(Operation):
 
 
         # For the very first subgrid we have no previous model → no freezing
+        aggressive_slice_freeze = True
+
         if freeze_seed_prev is None:
             n_core_max = 0
             m_core_max = 0
             P_freeze_max = 0
+            freeze_eligible_ions: Optional[Set[int]] = None
         else:
             # Clamp core and P_freeze against current geometry / P_max
             n_core_max = min(n_core0, n)
             m_core_max = min(m_core0, m)
-            # Only sensible to freeze passes we know something about; we cap by prev_P_star
             if prev_P_star is not None:
                 P_freeze_max = prev_P_star
             else:
                 P_freeze_max = 0
-
-        P_max=max(n+m, prev_P_star+max(n,m))
+            freeze_eligible_ions = None
 
         isDecCols = True
         # -------------------------------
@@ -2306,7 +2676,8 @@ class GlobalReconfigurations(Operation):
         def _enumerate_freeze_configs(
                 P_step_size: int = 1,
                 n_step_size: int = 1,
-                m_step_size: int = 1
+                m_step_size: int = 1,
+                P_max_step_size: int = 1
         ) -> Iterable[Tuple[int, int, int]]:
             """
             Yield (n_c, m_c, P_freeze) in descending 'freeze volume' order,
@@ -2316,22 +2687,32 @@ class GlobalReconfigurations(Operation):
             frozen core and the deepest time freeze consistent with the instance.
             """
             configs = []
-            for n_c in range(n_core_max, -1, -n_step_size):
-                for m_c in range(m_core_max, -1, -m_step_size):
-                    # we allow P_freeze = 0..P_freeze_max
-                    for P_freeze in range(P_freeze_max, -1, -P_step_size):
-                        vol = n_c * m_c * (P_freeze)
-                        configs.append((vol, n_c, m_c, P_freeze))
+            for P_max in range(R+P_freeze_min, max(prev_P_star+n+m, R+P_freeze_min+1), P_max_step_size):
+                for n_c in range(n_core_max, -1, -n_step_size):
+                    for m_c in range(m_core_max, -1, -m_step_size):
+                        # we allow P_freeze = 0..P_freeze_max
+                        for P_freeze in range(P_freeze_max, -1, -P_step_size):
+                            vol = ((max(prev_P_star+n+m, R+P_freeze_min+1)-P_max)**2) * n_c * m_c * (P_freeze)
+                            configs.append((vol, P_max, n_c, m_c, P_freeze))
 
+  
             # Sort descending by volume, then tie-break by n_c, m_c, P_freeze
-            configs.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+            configs.sort(key=lambda x: (x[0], 1/x[1], x[2], x[3], x[4]), reverse=True)
 
-            for _, n_c, m_c, P_freeze in configs:
-                yield n_c, m_c, P_freeze
+            for _, P_max, n_c, m_c, P_freeze in configs:
+                yield n_c, m_c, P_freeze, P_max
 
         chosen_solution=None
-        for n_c, m_c, P_freeze in _enumerate_freeze_configs(P_step_size=max(int(P_freeze_max/2),1), m_step_size=max(int(m_core_max/2),1), n_step_size=max(int(n_core_max/2),1)):
+        configs = _enumerate_freeze_configs(
+                P_step_size=max(int(P_freeze_max/2),1),
+                m_step_size=max(int(m_core_max/2),1),
+                n_step_size=max(int(n_core_max/2),1),
+                P_max_step_size=min(n,m)
+        )
+
+        for n_c, m_c, P_freeze, P_max in configs:
             mode = FREEZE_POS_ONLY
+            # Cap how deep we freeze in time so larger slices retain flexibility.
             freeze_params = {
                 "n_core": n_c,
                 "m_core": m_c,
@@ -2340,27 +2721,58 @@ class GlobalReconfigurations(Operation):
                 "mode": mode,
                 "prev_vpool": prev_vpool,
                 "prev_true_set": prev_true_set,
+                "freeze_ions": freeze_eligible_ions,
+                "freeze_passes": freeze_passes_prev,
             }
 
+            # if DEBUG_DIAG:
+            #     wise_debug_freeze_sanity(
+            #         label=f"n_c={n_c},m_c={m_c},P_freeze={P_freeze}",
+            #         freeze_params=freeze_params,
+            #         P_bound=P_max,
+                    
+            #     )
+
             # -------------------------------
-            # Level 2: Binary search on P (minimum number of passes per round)
+            # Level 2: Binary search on total passes Σ_r P_r (with fixed horizon P_max)
             # -------------------------------
-            P_lo = max(0, prev_P_star-1)
-            P_hi =P_max # upper bound on passes (e.g., worst-case moves across n rows + m columns)
-            P_star = None
+            rounds_under_sum_local = max(0, R - optimize_round_start)
+            B_lo = 0
+            B_hi = rounds_under_sum_local * P_max
+            sum_star = None
 
             if DEBUG_DIAG:
-                print(f"[WISE] starting binary search for P in [0, {P_hi}] with n_c={n_c}, m_c={m_c}, P_freeze={P_freeze} and mode={FREEZE_POS_ONLY}", flush=True)
+                print(
+                    f"[WISE] starting binary search for ΣP in [{B_lo}, {B_hi}] (opt rounds start={optimize_round_start}) "
+                    f"with n_c={n_c}, m_c={m_c}, P_freeze={P_freeze}, P_max={P_max} and mode={mode}",
+                    flush=True,
+                )
 
-            while P_lo <= P_hi:
-                P_mid = (P_lo + P_hi) // 2
+            while B_lo <= B_hi:
+                B_mid = (B_lo + B_hi) // 2
 
-                cnf_mid, vpool_mid, ions_mid, var_a_mid = _build_structural_cnf(
-                    P_mid,
+                (
+                    cnf_mid,
+                    vpool_mid,
+                    ions_mid,
+                    var_a_mid,
+                    grp_sel_mid,
+                    grp_meta_mid,
+                ) = _build_structural_cnf(
+                    P_max,
+                    sum_bound_B=B_mid,
                     use_wcnf=False,
                     add_boundary_soft=False,
-                    phase_label=f"P={P_mid}/SAT",
-                    freeze_params=freeze_params
+                    phase_label=f"ΣP={B_mid}/SAT",
+                    freeze_params=freeze_params,
+                    optimize_round_start=optimize_round_start,
+                    debug_core=True,
+                    core_granularity="coarse",
+                    debug_skip_cardinality=False
+                )
+
+                assumptions_mid = (
+                    [-lit for lit in grp_sel_mid.values()] if grp_sel_mid else None
                 )
 
                 t_sat_start = time.time()
@@ -2368,6 +2780,7 @@ class GlobalReconfigurations(Operation):
                     cnf_mid,
                     timeout_s=max_sat_time,
                     debug_prefix=None,
+                    assumptions=assumptions_mid,
                 )
 
                 # with Minisat22(bootstrap_with=cnf_mid.clauses) as sat:
@@ -2381,24 +2794,175 @@ class GlobalReconfigurations(Operation):
                         n_clauses = len(cnf_mid.clauses)
                     else:
                         n_clauses = len(cnf_mid.hard)  # just in case
-                 
-                if sat_ok:
                     print(
-                        f"[WISE]  test P={P_mid}, n_c={n_c}, m_c={m_c},: status={status_sat}, SAT={sat_ok}, "
+                        f"[WISE]  test ΣP={B_mid}, n_c={n_c}, m_c={m_c},: status={status_sat}, SAT={sat_ok}, "
                         f"vars={vpool_mid.top}, clauses={n_clauses}, "
                         f"time={t_sat_end - t_sat_start:.3f}s",
                         flush=True,
                     )
+                 
+                if sat_ok:
                     chosen_solution = (cnf_mid, vpool_mid, ions_mid, var_a_mid, model_mid,
-                                    freeze_params)
+                                    freeze_params, B_mid, P_max)
                     # Record this as the best so far and tighten upper bound
-                    P_star = P_mid
-                    P_hi = P_mid - 1
+                    sum_star = B_mid
+                    B_hi = B_mid - 1
                 else:
-                    # UNSAT: need more passes
-                    P_lo = P_mid + 1
+                    if sat_ok is False and grp_sel_mid and False :
+                        try:
+                            with Minisat22(bootstrap_with=cnf_mid.clauses) as s:
+                                assumptions = [-lit for lit in grp_sel_mid.values()]
+                                ok = s.solve(assumptions=assumptions)
+                                if not ok:
+                                    core = s.get_core() or []
+                                    inv = {lit: name for name, lit in grp_sel_mid.items()}
+
+                                    by_group: Dict[str, Set[int]] = {}
+                                    culprit_rounds: Set[int] = set()
+                                    culprit_fullnames: List[str] = []
+
+                                    for a in core:
+                                        var = abs(a)
+                                        fullname = inv.get(var)
+                                        if fullname is None:
+                                            continue
+                                        culprit_fullnames.append(fullname)
+                                        parts = fullname.split(":")
+                                        base = parts[0]
+
+                                        rounds_here: Set[int] = set()
+                                        for part in parts[1:]:
+                                            if part.startswith("r"):
+                                                try:
+                                                    rounds_here.add(int(part[1:]))
+                                                except ValueError:
+                                                    pass
+
+                                        if rounds_here:
+                                            by_group.setdefault(base, set()).update(rounds_here)
+                                            culprit_rounds.update(rounds_here)
+                                        else:
+                                            by_group.setdefault(base, set())
+
+                                    # High-level summary
+                                    print(f"[UNSAT-CORE] ΣP={B_mid} → groups:", flush=True)
+                                    for base in sorted(by_group.keys()):
+                                        rs = sorted(by_group[base])
+                                        if rs:
+                                            msg = f"  {base}: rounds {rs[0]}..{rs[-1]} (|R|={len(rs)})"
+                                        else:
+                                            msg = f"  {base}: no round tag"
+                                        print(msg, flush=True)
+
+                                    if culprit_rounds:
+                                        print(
+                                            f"[UNSAT-CORE] culprit rounds (union): {sorted(culprit_rounds)}",
+                                            flush=True,
+                                        )
+
+                                    # Brief per-round context (only first few rounds)
+                                    for r_bad in sorted(culprit_rounds)[:5]:
+                                        if 0 <= r_bad < len(P_arr):
+                                            print(
+                                                f"[UNSAT-CORE]   r={r_bad}, |P_arr[{r_bad}]| = {len(P_arr[r_bad])}",
+                                                flush=True,
+                                            )
+                                        if 0 <= r_bad < len(BT):
+                                            print(
+                                                f"[UNSAT-CORE]   r={r_bad}, |BT[{r_bad}]|    = {len(BT[r_bad])}",
+                                                flush=True,
+                                            )
+
+                                    culprit_bases = set(by_group.keys())
+                                    hints = []
+                                    if "PAIR_REQ" in culprit_bases:
+                                        hints.append("PAIR_REQ (check BT vs P_arr)")
+                                    if "CARD_CELL" in culprit_bases or "CARD_ION" in culprit_bases:
+                                        hints.append("CARD_* (global permutation)")
+                                    if "PHASE_MONO" in culprit_bases:
+                                        hints.append("PHASE_MONO (phase monotonicity)")
+                                    if "H_GATE" in culprit_bases or "V_GATE" in culprit_bases:
+                                        hints.append("H_GATE/V_GATE (parity/gating)")
+                                    if "ROWBLOCK_LINK" in culprit_bases:
+                                        hints.append("ROWBLOCK_LINK (row/block linkage vs BT/pairs)")
+
+                                    if hints:
+                                        print("[UNSAT-CORE] key groups in core:", ", ".join(hints), flush=True)
+
+                                    # --- Freeze-specific summary (short) ---
+                                    freeze_names = [
+                                        name
+                                        for name in sorted(set(culprit_fullnames))
+                                        if name.startswith("CARD_CELL_FREEZE")
+                                        or name.startswith("CARD_ION_FREEZE")
+                                    ]
+                                    if freeze_names:
+                                        freeze_cells: Dict[Tuple[int, int, int, int], Dict[str, Any]] = {}
+                                        freeze_ions: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+
+                                        for name in freeze_names:
+                                            metas = grp_meta_mid.get(name, []) if grp_meta_mid else []
+                                            for meta in metas:
+                                                kind = meta.get("kind")
+                                                if kind == "freeze_cell_unit":
+                                                    key = (
+                                                        meta["r"],
+                                                        meta["p"],
+                                                        meta["row"],
+                                                        meta["col"],
+                                                    )
+                                                    freeze_cells[key] = {"ion": meta.get("ion")}
+                                                elif kind == "freeze_ion_pos":
+                                                    key = (
+                                                        meta["r"],
+                                                        meta["p"],
+                                                        meta["ion"],
+                                                    )
+                                                    freeze_ions.setdefault(
+                                                        key,
+                                                        {
+                                                            "fixed": (
+                                                                meta.get("fixed_row"),
+                                                                meta.get("fixed_col"),
+                                                            )
+                                                        },
+                                                    )
+
+                                        print(
+                                            f"[UNSAT-CORE] freeze constraints in core: "
+                                            f"{len(freeze_cells)} frozen cells, {len(freeze_ions)} frozen ion-positions",
+                                            flush=True,
+                                        )
+
+                                        # Show only a few examples so it stays readable
+                                        for (r_f, p_f, row_f, col_f), info in list(sorted(freeze_cells.items()))[:5]:
+                                            print(
+                                                f"  FREEZE_CELL example: r={r_f}, p={p_f}, "
+                                                f"(row={row_f}, col={col_f}) → ion={info['ion']}",
+                                                flush=True,
+                                            )
+
+                                        for (r_f, p_f, ion_f), info in list(sorted(freeze_ions.items()))[:5]:
+                                            fixed_row, fixed_col = info["fixed"]
+                                            print(
+                                                f"  FREEZE_ION_POS example: r={r_f}, p={p_f}, "
+                                                f"ion={ion_f} fixed at ({fixed_row},{fixed_col})",
+                                                flush=True,
+                                            )
+                                    else:
+                                        print("[UNSAT-CORE] no freeze clauses identified in core.", flush=True)
+
+                                else:
+                                    print(
+                                        "[UNSAT-CORE] Unexpected: SAT under assumptions while previous solver said UNSAT.",
+                                        flush=True,
+                                    )
+                        except Exception as e:
+                            print(f"[UNSAT-CORE] core extraction error: {e}", flush=True)
+                    # UNSAT: need more passes in aggregate
+                    B_lo = B_mid + 1
             
-            if (P_star is not None) or (n_c==0 or m_c==0):
+            if (sum_star is not None):
                 break
             if isDecCols:
                 m_c -=1
@@ -2409,13 +2973,14 @@ class GlobalReconfigurations(Operation):
 
         
 
-        if P_star is None:
-            raise RuntimeError("No feasible layout for any P in [0, n+m].")
+        if sum_star is None:
+            raise RuntimeError("No feasible layout for any Σ_r P_r bound in [0, R * P_max].")
 
-        _, vpool_sat, ions_sat, var_a_sat, sat_model_star, freeze_used = chosen_solution
+        _, vpool_sat, ions_sat, var_a_sat, sat_model_star, freeze_used, best_sum_bound, P_max = chosen_solution
         if DEBUG_DIAG:
-            print(f"[WISE] minimal P* found: {P_star}", flush=True)
+            print(f"[WISE] minimal ΣP found: {best_sum_bound} (P_max={P_max})", flush=True)
 
+        pass_horizon = P_max
 
         layouts_before: List[np.ndarray] = []
         cur = A_in.copy()
@@ -2426,7 +2991,7 @@ class GlobalReconfigurations(Operation):
                 for c in range(m):
                     found = None
                     for ion in ions_sat:
-                        if var_a_sat(r, P_star, d, c, ion) in sat_model_star:
+                        if var_a_sat(r, pass_horizon, d, c, ion) in sat_model_star:
                             found = ion
                             break
                     if found is None:
@@ -2446,25 +3011,31 @@ class GlobalReconfigurations(Operation):
             n_sub=n,
             m_sub=m,
             R=R,
-            P_bound=P_star,
+            P_bound=pass_horizon,
             core_rows=n,       # current core size you *plan* to freeze in next slice
             core_cols=m,
             P_freeze=P_freeze,
             core_ion_set=ions_sat,
         )
         # -------------------------------
-        # Level 3: MaxSAT refinement at P*
+        # Level 3: MaxSAT refinement under ΣP*
         # -------------------------------
         if DEBUG_DIAG:
-            print(f"[WISE] building WCNF at P*={P_star} for MaxSAT...", flush=True)
+            print(
+                f"[WISE] building WCNF at ΣP*={best_sum_bound}, P_max={pass_horizon} for MaxSAT...",
+                flush=True,
+            )
 
         t_build_start = time.time()
-        wcnf, vpool_w, ions_w, var_a_w = _build_structural_cnf(
-            P_star,
+        wcnf, vpool_w, ions_w, var_a_w, _, _ = _build_structural_cnf(
+            pass_horizon,
+            sum_bound_B=best_sum_bound,
             use_wcnf=True,
             add_boundary_soft=True,
-            phase_label=f"P*={P_star}/WCNF",
-            freeze_params=freeze_used
+            phase_label=f"ΣP*={best_sum_bound}/WCNF",
+            freeze_params=freeze_used,
+            optimize_round_start=optimize_round_start,
+            debug_skip_cardinality=False
         )
         t_build_end = time.time()
 
@@ -2524,7 +3095,7 @@ class GlobalReconfigurations(Operation):
             n_sub=n,
             m_sub=m,
             R=R,
-            P_bound=P_star,
+            P_bound=pass_horizon,
             core_rows=n,       # current core size you *plan* to freeze in next slice
             core_cols=m,
             P_freeze=P_freeze,
@@ -2533,9 +3104,10 @@ class GlobalReconfigurations(Operation):
 
 
         # -------------------------------
-        # Decode layouts a[r,P_star] from model_used
+        # Decode layouts a[r,P_max] from model_used
         # -------------------------------
         model_set = {lit for lit in model_used if lit > 0}
+        P_bounds = ([pass_horizon+n+m]*optimize_round_start + [pass_horizon]*(R-optimize_round_start))
 
         def lit_true(v: int) -> bool:
             return v in model_set
@@ -2549,7 +3121,7 @@ class GlobalReconfigurations(Operation):
                 for c in range(m):
                     found = None
                     for ion in ions_used:
-                        if lit_true(var_a_used(r, P_star, d, c, ion)):
+                        if lit_true(var_a_used(r, P_bounds[r], d, c, ion)):
                             found = ion
                             break
                     if found is None:
@@ -2567,15 +3139,43 @@ class GlobalReconfigurations(Operation):
             n=n,
             m=m,
             R=R,
-            P_bound=P_star,
+            P_bound=pass_horizon,
         )
         # print(schedule)
+        per_round_usage = extract_round_pass_usage(
+            model=model_used,
+            vpool=vpool_used,
+            R=R,
+            P_bound=pass_horizon,
+        )
+        per_round_z = extract_round_pass_usage(
+            sat_model_star,
+            vpool_sat,
+            R,
+            pass_horizon,
+        )
+        sum_all = sum(per_round_z)
+        sum_tail = sum(per_round_z[optimize_round_start:])
+
+        print(
+            f"[WISE] ΣP per round: {per_round_z}, "
+            f"Σ_all={sum_all}, Σ_tail={sum_tail}, "
+            f"best_sum_bound={best_sum_bound}"
+        )
+
+        if optimize_round_start < R:
+            freeze_passes_next = sorted({P_bounds[r] for r in range(optimize_round_start, R)})
+        else:
+            freeze_passes_next = []
+
         freeze_seed_next = {
             "n_core0": n,
             "m_core0": m,
-            "P_freeze0": P_star,
+            "P_freeze0": pass_horizon,
             "prev_vpool": vpool_used,
-            "prev_true_set": model_set,
+            "prev_true_set": {lit for lit in model_used if lit > 0},
+            "P_freeze_min": min(per_round_usage) if per_round_usage else 0,
+            "freeze_passes": freeze_passes_next,
         }
 
         return layouts, schedule, freeze_seed_next

@@ -23,7 +23,8 @@ def _grow_slice_and_route(
     wiseArch: QCCDWiseArch,
     P_arr: List[List[Tuple[int, int]]],
     subgridsize: Tuple[int, int, int],
-    active_ions: List[int] = None
+    active_ions: List[int] = None,
+    ignore_initial_reconfig: bool = False,
 ) -> Tuple[List[np.ndarray], List[List[Dict[str, Any]]]]:
     """
     Internal helper: given a global arrangement (oldArrangementArr) and a small
@@ -138,7 +139,8 @@ def _grow_slice_and_route(
             wB_col=wB_col,
             wB_row=wB_row,
             freeze_seed_prev=freeze_seed_prev,
-            full_P_arr=full_P_arr
+            full_P_arr=full_P_arr,
+            ignore_initial_reconfig=ignore_initial_reconfig,
         )
 
         print(f"Current P_arr: {P_arr_in_grid}")
@@ -439,7 +441,12 @@ def ionRoutingWISEArch(
                 # 4a) Between MS rounds: re-route using next lookahead window of pairs
                 P_arr = parallelPairs[idx : min(len(parallelPairs), lookahead + idx)].copy()
                 layouts_after, schedules = _grow_slice_and_route(
-                    oldArrangementArr, wiseArch, P_arr, subgridsize, active_ions=active_ions
+                    oldArrangementArr,
+                    wiseArch,
+                    P_arr,
+                    subgridsize,
+                    active_ions=active_ions,
+                    ignore_initial_reconfig=(idx==0),
                 )
             layout_after = layouts_after.pop(0)
             schedule = schedules.pop(0)
