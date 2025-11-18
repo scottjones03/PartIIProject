@@ -25,6 +25,7 @@ def _grow_slice_and_route(
     subgridsize: Tuple[int, int, int],
     active_ions: List[int] = None,
     ignore_initial_reconfig: bool = False,
+    base_pmax_in: int = None
 ) -> Tuple[List[np.ndarray], List[List[Dict[str, Any]]]]:
     """
     Internal helper: given a global arrangement (oldArrangementArr) and a small
@@ -55,6 +56,8 @@ def _grow_slice_and_route(
     R = len(P_arr)
     if R == 0:
         return []
+    if base_pmax_in is None:
+        base_pmax_in = R
 
     boundary_targets: List[Dict[int, Tuple[int, int]]] = [dict() for _ in range(R)]
 
@@ -64,10 +67,10 @@ def _grow_slice_and_route(
     incrow = False            # zig-zag grow: col, row, col, row, ...
 
     layouts_after: List[np.ndarray] = []
-    freeze_seed_prev=None
 
     full_P_arr = P_arr.copy()
     BT_in_grid: List[Dict[int, Tuple[int, int]]] = [{} for _ in range(R)]
+    prev_pmax = None
 
     while True:
         # 1) Build the current growing grid anchored at (0,0)
@@ -130,7 +133,7 @@ def _grow_slice_and_route(
         #    Level-2 and Level-3 happen inside _optimal_QMR_for_WISE:
         #      - Level-2: SAT + D-minimisation,
         #      - Level-3: small MaxSAT to avoid boundary cells.
-        layouts_after, schedules, freeze_seed_prev = GlobalReconfigurations._optimal_QMR_for_WISE(
+        layouts_after, schedules, prev_pmax = GlobalReconfigurations._optimal_QMR_for_WISE(
             currentGrid,
             P_arr_in_grid,
             k=wiseArch.k,
@@ -138,9 +141,10 @@ def _grow_slice_and_route(
             active_ions=active_ions,
             wB_col=wB_col,
             wB_row=wB_row,
-            freeze_seed_prev=freeze_seed_prev,
             full_P_arr=full_P_arr,
             ignore_initial_reconfig=ignore_initial_reconfig,
+            base_pmax_in=base_pmax_in,
+            prev_pmax=prev_pmax
         )
 
         print(f"Current P_arr: {P_arr_in_grid}")
@@ -258,6 +262,7 @@ def ionRoutingWISEArch(
     operations: Sequence[QubitOperation],
     lookahead: int = 2,
     subgridsize: Tuple[int, int, int] = (6, 4, 1),
+    base_pmax_in: int = None
 ) -> Tuple[Sequence[Operation], Sequence[int], float]:
     """
     Route a WISE-style QCCD architecture in **three optimisation levels**:
@@ -447,6 +452,7 @@ def ionRoutingWISEArch(
                     subgridsize,
                     active_ions=active_ions,
                     ignore_initial_reconfig=(idx==0),
+                    base_pmax_in=base_pmax_in
                 )
             layout_after = layouts_after.pop(0)
             schedule = schedules.pop(0)
