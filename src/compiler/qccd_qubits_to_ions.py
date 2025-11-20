@@ -17,7 +17,6 @@ from src.compiler.qccd_parallelisation import *
 MAX_ITER = 20_000
         
 
-
 def _merge_clusters_to_limit(
     clusters: Sequence[Tuple[Sequence["Ion"], npt.NDArray[np.float64]]],
     max_clusters: int,
@@ -31,18 +30,36 @@ def _merge_clusters_to_limit(
       - ions   : Sequence[Ion]
       - centre : np.array([x, y])
 
-    Merging strategy:
-      - repeatedly pick the closest pair of cluster centres whose combined
-        size <= capacity, merge them, and update the centre as a weighted mean.
-      - if no such pair exists but we still have too many clusters, raise.
+    Strategy:
+      1) Try to repeatedly merge the closest pair of clusters whose combined
+         size <= capacity, updating the centre as a weighted mean.
+      2) If no such pair exists but we still have too many clusters, attempt
+         to *dissolve* a small cluster by redistributing its ions into other
+         clusters (possibly multiple) that still have free capacity, again
+         using weighted-mean centres.
+      3) If even dissolution is impossible, raise RuntimeError.
     """
+    # Make clusters mutable: (list_of_ions, centre_array)
     clusters = [(list(ions), np.array(centre, dtype=float)) for ions, centre in clusters]
+
+    def _total_free_capacity() -> int:
+        return sum(max(0, capacity - len(ions)) for ions, _ in clusters)
+
+    # Quick sanity: if there is fundamentally not enough trap capacity, bail early
+    total_ions = sum(len(ions) for ions, _ in clusters)
+    if max_clusters * capacity < total_ions:
+        raise RuntimeError(
+            f"Insufficient total capacity: max_clusters={max_clusters}, "
+            f"capacity={capacity}, total_ions={total_ions}"
+        )
 
     while len(clusters) > max_clusters:
         best_pair = None
         best_dist2 = None
 
-        # Find best pair to merge (closest centres, respecting capacity)
+        # ------------------------------------------------------------------
+        # 1) Try merging whole clusters
+        # ------------------------------------------------------------------
         for i in range(len(clusters)):
             ions_i, centre_i = clusters[i]
             size_i = len(ions_i)
@@ -56,30 +73,121 @@ def _merge_clusters_to_limit(
                     best_pair = (i, j)
                     best_dist2 = d2
 
-        if best_pair is None:
-            # We cannot reduce the number of clusters further without
-            # violating the per-trap capacity; this is a genuine
-            # impossibility (either architecture underprovisioned or
-            # constraints inconsistent).
-            raise RuntimeError(
-                f"Cannot reduce clusters to max_clusters={max_clusters} "
-                f"without exceeding capacity={capacity}. "
-                f"Current #clusters={len(clusters)}."
+        if best_pair is not None:
+            # Perform merge
+            i, j = best_pair
+            ions_i, centre_i = clusters[i]
+            ions_j, centre_j = clusters[j]
+
+            merged_ions = ions_i + ions_j
+            total_size = len(merged_ions)
+
+            merged_centre = (
+                centre_i * len(ions_i) + centre_j * len(ions_j)
+            ) / float(total_size)
+
+            # Remove old clusters and append merged one
+            for idx in sorted((i, j), reverse=True):
+                clusters.pop(idx)
+            clusters.append((merged_ions, merged_centre))
+            continue
+
+        # ------------------------------------------------------------------
+        # 2) No mergeable pair: try dissolving a small cluster
+        # ------------------------------------------------------------------
+        # We will attempt to pick a donor cluster and redistribute all its ions
+        # into other clusters with free capacity. This reduces cluster count by 1.
+        dissolved = False
+
+        # Sort potential donors by size ascending (prefer small clusters to dissolve)
+        donor_candidates = sorted(
+            enumerate(clusters),
+            key=lambda x: len(x[1][0])
+        )
+
+        for donor_idx, (donor_ions, donor_centre) in donor_candidates:
+            donor_size = len(donor_ions)
+            if donor_size == 0:
+                # degenerate, just drop it
+                clusters.pop(donor_idx)
+                dissolved = True
+                break
+
+            # Prepare list of potential receivers with free capacity
+            receivers = []
+            for j, (ions_j, centre_j) in enumerate(clusters):
+                if j == donor_idx:
+                    continue
+                free = capacity - len(ions_j)
+                if free > 0:
+                    receivers.append((j, free, centre_j))
+
+            if not receivers:
+                # This donor cannot be dissolved; try next donor
+                continue
+
+            total_free = sum(free for _, free, _ in receivers)
+            if total_free < donor_size:
+                # Not enough slack in other clusters for this donor
+                continue
+
+            # Sort receivers by distance to donor centre (closest first)
+            receivers.sort(
+                key=lambda t: float(np.sum((donor_centre - t[2]) ** 2))
             )
 
-        i, j = best_pair
-        ions_i, centre_i = clusters[i]
-        ions_j, centre_j = clusters[j]
+            ions_to_assign = list(donor_ions)
 
-        merged_ions = ions_i + ions_j
-        total_size = len(merged_ions)
-        # weighted average of centres by ion count
-        merged_centre = (centre_i * len(ions_i) + centre_j * len(ions_j)) / total_size
+            for j, free, centre_j in receivers:
+                if not ions_to_assign:
+                    break
 
-        # Remove old clusters (careful with indices) and append merged one
-        for idx in sorted((i, j), reverse=True):
-            clusters.pop(idx)
-        clusters.append((merged_ions, merged_centre))
+                take = min(free, len(ions_to_assign))
+                moved = ions_to_assign[:take]
+                ions_to_assign = ions_to_assign[take:]
+
+                # Update receiver ions and centre (weighted by counts)
+                ions_j, centre_j_curr = clusters[j]
+                old_size = len(ions_j)
+                ions_j.extend(moved)
+                new_size = old_size + len(moved)
+
+                # Approximate new centre as weighted mean of old centre and donor centre
+                # (we don't know individual ion coordinates here; donor_centre is an average)
+                new_centre = (
+                    centre_j_curr * old_size + donor_centre * len(moved)
+                ) / float(new_size)
+                clusters[j] = (ions_j, new_centre)
+
+            # All donor ions should be reassigned
+            if ions_to_assign:
+                # This should not happen because total_free >= donor_size
+                # but be defensive: undo partial moves for this donor and try next
+                raise RuntimeError(
+                    "Internal error in _merge_clusters_to_limit: "
+                    "failed to reassign all donor ions despite sufficient free capacity."
+                )
+
+            # Remove donor cluster entirely (we've redistributed its ions)
+            clusters.pop(donor_idx)
+            dissolved = True
+            break
+
+        if dissolved:
+            # We successfully reduced cluster count by dissolving one cluster
+            continue
+
+        # ------------------------------------------------------------------
+        # 3) Neither merging nor dissolution is possible -> genuine impossibility
+        # ------------------------------------------------------------------
+        for cl in clusters:
+            print(cl)
+        raise RuntimeError(
+            f"Cannot reduce clusters to max_clusters={max_clusters} "
+            f"without exceeding capacity={capacity}. "
+            f"Current #clusters={len(clusters)}, total_ions={total_ions}, "
+            f"total_free_capacity={_total_free_capacity()}."
+        )
 
     return clusters
 

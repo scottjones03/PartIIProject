@@ -8,7 +8,8 @@ from typing import (
     Mapping,
     Set,
     Dict,
-    Iterable
+    Iterable,
+    Union
 )
 import abc
 from src.utils.qccd_nodes import *
@@ -38,7 +39,8 @@ import math
 
 # ---------- UNSAT core helpers ----------
 
-
+class NoFeasibleLayoutError(RuntimeError):
+    ...
 class CoreGroups:
     """
     Manage assumption selectors for clause families to enable UNSAT core debug.
@@ -667,7 +669,10 @@ class GlobalReconfigurations(Operation):
         full_P_arr: List[List[Tuple[int, int]]]=[],
         ignore_initial_reconfig: bool = False,
         base_pmax_in: int = None,
-        prev_pmax: int = None
+        prev_pmax: int = None,
+        grid_origin: Tuple[int, int] = (0, 0),
+        boundary_adjacent: Optional[Dict[str, bool]] = None,
+        cross_boundary_prefs: Optional[List[Dict[int, Set[str]]]] = None,
     ) -> Tuple[List[np.ndarray], List[List[Dict[str, Any]]], int]:
         DEBUG_DIAG = True
         DEBUG_DIAG_DETAILED = False
@@ -682,11 +687,29 @@ class GlobalReconfigurations(Operation):
         if len(full_P_arr)==0:
             full_P_arr=P_arr
 
+        if boundary_adjacent is None:
+            boundary_adjacent = {"top": False, "bottom": False, "left": False, "right": False}
+        else:
+            boundary_adjacent = {
+                "top": bool(boundary_adjacent.get("top", False)),
+                "bottom": bool(boundary_adjacent.get("bottom", False)),
+                "left": bool(boundary_adjacent.get("left", False)),
+                "right": bool(boundary_adjacent.get("right", False)),
+            }
+
+        if cross_boundary_prefs is None or len(cross_boundary_prefs) != R:
+            cross_boundary_prefs = [dict() for _ in range(R)]
+
         if base_pmax_in is None:
             base_pmax_in = R
 
         if prev_pmax is None:
             prev_pmax = 0
+
+        row_offset = 0
+        col_offset = 0
+        if grid_origin is not None:
+            row_offset, col_offset = grid_origin
 
         CAPACITY = k
 
@@ -785,7 +808,52 @@ class GlobalReconfigurations(Operation):
                 )
 
         ions = sorted(ions_all)
-        num_blocks = math.ceil(m / k)
+        first_block_idx = col_offset // CAPACITY
+        last_block_idx = (col_offset + m - 1) // CAPACITY
+        num_blocks = last_block_idx - first_block_idx + 1
+    
+        block_cells: List[List[Tuple[int, int]]] = []
+        block_fully_inside: List[bool] = []
+        block_widths: List[int] = []
+        global_patch_start = col_offset
+        global_patch_end = col_offset + m
+
+        for b_local in range(num_blocks):
+            b_global = first_block_idx + b_local
+            global_start = b_global * CAPACITY
+            global_end = (b_global + 1) * CAPACITY
+            local_start = max(0, global_start - col_offset)
+            local_end = min(m, global_end - col_offset)
+            cells: List[Tuple[int, int]] = []
+            for d in range(n):
+                for j_local in range(local_start, local_end):
+                    cells.append((d, j_local))
+            block_cells.append(cells)
+            block_widths.append(local_end-local_start)
+            block_fully_inside.append(
+                (global_start >= global_patch_start)
+                and (global_end <= global_patch_end)
+            )
+        ions_set = set(ions)
+
+        def compute_outer_pairs() -> Optional[List[List[Tuple[int, int]]]]:
+            if not full_P_arr:
+                return None
+            outer: List[List[Tuple[int, int]]] = []
+            for r in range(R):
+                inner_set = set(P_arr[r]) if r < len(P_arr) else set()
+                round_outer: List[Tuple[int, int]] = []
+                full_round = full_P_arr[r] if r < len(full_P_arr) else []
+                for pair in full_round:
+                    if pair in inner_set:
+                        continue
+                    i1, i2 = pair
+                    if i1 in ions_set or i2 in ions_set:
+                        round_outer.append(pair)
+                outer.append(round_outer)
+            return outer
+
+        outer_pairs = compute_outer_pairs()
 
         # -------------------------------
         # Structural CNF / WCNF builder for given P_bound
@@ -803,6 +871,9 @@ class GlobalReconfigurations(Operation):
             core_granularity: str = "coarse",
             debug_skip_cardinality: bool = False,
             debug_disable_pairs_rounds: Optional[Set[int]] = None,
+            boundary_adjacent: Optional[Dict[str, bool]] = None,
+            cross_boundary_prefs: Optional[List[Dict[int, Set[str]]]] = None,
+            boundary_capacity_factor: float = 1.0,
         ):
             vpool = IDPool()
 
@@ -873,6 +944,65 @@ class GlobalReconfigurations(Operation):
                 disable_pairs_rounds = set(debug_disable_pairs_rounds)
 
             P_bounds = ([P_bound + n + m] * optimize_round_start + [P_bound] * (R - optimize_round_start))
+
+            if boundary_adjacent is None:
+                boundary_adjacent = {
+                    "top": True,
+                    "bottom": True,
+                    "left": True,
+                    "right": True,
+                }
+            else:
+                boundary_adjacent = {
+                    "top": bool(boundary_adjacent.get("top", False)),
+                    "bottom": bool(boundary_adjacent.get("bottom", False)),
+                    "left": bool(boundary_adjacent.get("left", False)),
+                    "right": bool(boundary_adjacent.get("right", False)),
+                }
+
+            if cross_boundary_prefs is None:
+                cross_boundary_prefs_norm: List[Dict[int, Set[str]]] = [dict() for _ in range(R)]
+            else:
+                cross_boundary_prefs_norm = []
+                for r in range(R):
+                    prefs_r = cross_boundary_prefs[r] if r < len(cross_boundary_prefs) else {}
+                    normalized: Dict[int, Set[str]] = {}
+                    for ion, dirs in prefs_r.items():
+                        normalized[ion] = set(dirs)
+                    cross_boundary_prefs_norm.append(normalized)
+
+            half_h = max(1, n // 2)
+            half_w = max(1, m // 2)
+
+            def cells_for_direction(direction: str) -> List[Tuple[int, int]]:
+                cells: List[Tuple[int, int]] = []
+                if direction == "left":
+                    if not boundary_adjacent["left"]:
+                        return cells
+                    for d in range(n):
+                        for c in range(half_w):
+                            cells.append((d, c))
+                elif direction == "right":
+                    if not boundary_adjacent["right"]:
+                        return cells
+                    start = max(0, m - half_w)
+                    for d in range(n):
+                        for c in range(start, m):
+                            cells.append((d, c))
+                elif direction == "top":
+                    if not boundary_adjacent["top"]:
+                        return cells
+                    for d in range(half_h):
+                        for c in range(m):
+                            cells.append((d, c))
+                elif direction == "bottom":
+                    if not boundary_adjacent["bottom"]:
+                        return cells
+                    start = max(0, n - half_h)
+                    for d in range(start, n):
+                        for c in range(m):
+                            cells.append((d, c))
+                return cells
 
             # ------------------------------------------------------------------
             # (0) Global permutation: exactly one ion per cell AND each ion in exactly one cell
@@ -1117,14 +1247,12 @@ class GlobalReconfigurations(Operation):
                         for aj in cell_lits:
                             add_hard([-aj, re], g_rb_r)
 
-                    # w_end
-                    for b in range(num_blocks):
-                        we = var_w_end(r, ion, b)
-                        cells: List[int] = []
-                        for d in range(n):
-                            for j in range(b * CAPACITY, min((b + 1) * CAPACITY, m)):
-                                cells.append(var_a(r, P_bounds[r], d, j, ion))
-                        if cells:
+                    # w_end (global block alignment)
+                    for b_local in range(num_blocks):
+                        we = var_w_end(r, ion, b_local)
+                        cell_list = block_cells[b_local]
+                        cells = [var_a(r, P_bounds[r], d, j_local, ion) for (d, j_local) in cell_list]
+                        if block_fully_inside[b_local] or (block_widths[b_local]>1):
                             add_hard([-we] + cells, g_rb_r)
                             for aj in cells:
                                 add_hard([-aj, we], g_rb_r)
@@ -1146,10 +1274,10 @@ class GlobalReconfigurations(Operation):
                                 re2 = var_row_end(r, i2, d)
                                 add_hard([-re1, re2], g_pair_r)
                                 add_hard([-re2, re1], g_pair_r)
-                            # Same block
-                            for b in range(num_blocks):
-                                we1 = var_w_end(r, i1, b)
-                                we2 = var_w_end(r, i2, b)
+                            # Same block (global aligned); only enforce for fully covered blocks
+                            for b_local in range(num_blocks):
+                                we1 = var_w_end(r, i1, b_local)
+                                we2 = var_w_end(r, i2, b_local)
                                 add_hard([-we1, we2], g_pair_r)
                                 add_hard([-we2, we1], g_pair_r)
 
@@ -1157,68 +1285,124 @@ class GlobalReconfigurations(Operation):
             # (6) Optional Level-3 soft clauses (boundary avoidance, swap-cost)
             # ------------------------------------------------------------------
             if use_wcnf and add_boundary_soft and (wB_row > 0 or wB_col > 0):
-                # Precompute unique boundary cells for this subgrid:
-                #   - last column (all rows)
-                #   - last row (all columns)
-                boundary_cells = set()
-                # last column
-                for d in range(n):
-                    boundary_cells.add((d, m - 1))
-                # last row
-                for jcol in range(m):
-                    boundary_cells.add((n - 1, jcol))
-                boundary_cells = sorted(boundary_cells)
+                inner_ions_per_round: List[Set[int]] = []
+                for r in range(R):
+                    inner_ions = set()
+                    for (i1, i2) in P_arr[r]:
+                        inner_ions.add(i1)
+                        inner_ions.add(i2)
+                    inner_ions.update(BT[r].keys())
+                    inner_ions_per_round.append(inner_ions)
 
                 for r in range(R):
+                    inner_ions = inner_ions_per_round[r]
+                    cross_prefs_r = cross_boundary_prefs[r] if r < len(cross_boundary_prefs) else {}
                     for ion in ions:
-                        in_minor = ion_in_minor_P_arr(r, ion)   # gate in this subgrid
-                        in_full = ion_in_full_P_arr(r, ion)     # gate somewhere (this or later)
+                        dirs = cross_prefs_r.get(ion)
+                        if dirs:
+                            for direction in dirs:
+                                if direction in ("left", "right") and wB_col > 0:
+                                    if not boundary_adjacent.get(direction, False):
+                                        continue
+                                    target_col = 0 if direction == "left" else m - 1
+                                    lits = [var_a(r, P_bounds[r], d, target_col, ion) for d in range(n)]
+                                    if lits:
+                                        add_soft(lits, weight=wB_col)
+                                if direction in ("top", "bottom") and wB_row > 0:
+                                    if not boundary_adjacent.get(direction, False):
+                                        continue
+                                    target_row = 0 if direction == "top" else n - 1
+                                    lits = [var_a(r, P_bounds[r], target_row, jcol, ion) for jcol in range(m)]
+                                    if lits:
+                                        add_soft(lits, weight=wB_row)
 
-                        # If ion never participates in any gate, don't care about its boundary placement.
-                        if not in_minor and not in_full:
+                        if ion in inner_ions:
+                            if boundary_adjacent.get("left", False) and wB_col > 0:
+                                for d in range(n):
+                                    add_soft([-var_a(r, P_bounds[r], d, 0, ion)], weight=wB_col)
+                            if boundary_adjacent.get("right", False) and wB_col > 0:
+                                for d in range(n):
+                                    add_soft([-var_a(r, P_bounds[r], d, m - 1, ion)], weight=wB_col)
+                            if boundary_adjacent.get("top", False) and wB_row > 0:
+                                for jcol in range(m):
+                                    add_soft([-var_a(r, P_bounds[r], 0, jcol, ion)], weight=wB_row)
+                            if boundary_adjacent.get("bottom", False) and wB_row > 0:
+                                for jcol in range(m):
+                                    add_soft([-var_a(r, P_bounds[r], n - 1, jcol, ion)], weight=wB_row)
+
+            if cross_boundary_prefs_norm and any(boundary_adjacent.values()):
+                factor = max(0.0, min(1.0, boundary_capacity_factor))
+                dir_capacity: Dict[str, int] = {}
+                if boundary_adjacent.get("top", False):
+                    dir_capacity["top"] = int(round(half_h * m * factor))
+                if boundary_adjacent.get("bottom", False):
+                    dir_capacity["bottom"] = int(round(half_h * m * factor))
+                if boundary_adjacent.get("left", False):
+                    dir_capacity["left"] = int(round(half_w * n * factor))
+                if boundary_adjacent.get("right", False):
+                    dir_capacity["right"] = int(round(half_w * n * factor))
+
+                ions_per_round_dir: Dict[Tuple[int, str], List[int]] = defaultdict(list)
+                for r, prefs_r in enumerate(cross_boundary_prefs_norm):
+                    for ion, dirs in prefs_r.items():
+                        for direction in dirs:
+                            if direction in dir_capacity:
+                                ions_per_round_dir[(r, direction)].append(ion)
+
+                for key in ions_per_round_dir:
+                    ions_per_round_dir[key].sort()
+
+                enforced_dirs_per_ion: Dict[Tuple[int, int], Set[str]] = defaultdict(set)
+                for (r, direction), ion_list in ions_per_round_dir.items():
+                    cap = dir_capacity.get(direction, 0)
+                    if cap <= 0:
+                        continue
+                    for ion in ion_list[:cap]:
+                        enforced_dirs_per_ion[(r, ion)].add(direction)
+
+                def _band_cells_for_dirs(directions: Set[str]) -> List[Tuple[int, int]]:
+                    row_min, row_max = 0, n - 1
+                    col_min, col_max = 0, m - 1
+                    if "top" in directions:
+                        row_max = min(row_max, half_h - 1)
+                    if "bottom" in directions:
+                        row_min = max(row_min, n - half_h)
+                    if "left" in directions:
+                        col_max = min(col_max, half_w - 1)
+                    if "right" in directions:
+                        col_min = max(col_min, m - half_w)
+                    if row_min > row_max or col_min > col_max:
+                        return []
+                    return [
+                        (rr, cc)
+                        for rr in range(row_min, row_max + 1)
+                        for cc in range(col_min, col_max + 1)
+                    ]
+
+                for r in range(R):
+                    prefs_r = cross_boundary_prefs_norm[r]
+                    if not prefs_r:
+                        continue
+                    P_final = P_bounds[r]
+                    for ion in prefs_r.keys():
+                        enforced_dirs = enforced_dirs_per_ion.get((r, ion))
+                        if not enforced_dirs:
                             continue
-
-                        # --------------------------------------------------------------
-                        # Case 1: ion has a gate in this subgrid (current rounds)
-                        #         → avoid putting it on the boundary at end-of-round.
-                        # --------------------------------------------------------------
-                        if in_minor:
-                            if wB_col > 0:
-                                # Avoid last-column cells.
-                                for d, jcol in boundary_cells:
-                                    if jcol == m - 1:
-                                        add_soft(
-                                            [-var_a(r, P_bounds[r], d, jcol, ion)],
-                                            weight=wB_col,
-                                        )
-
-                            if wB_row > 0:
-                                # Avoid last-row cells.
-                                for d, jcol in boundary_cells:
-                                    if d == n - 1:
-                                        add_soft(
-                                            [-var_a(r, P_bounds[r], d, jcol, ion)],
-                                            weight=wB_row,
-                                        )
-
-                        # --------------------------------------------------------------
-                        # Case 2: ion has no gate in this subgrid but has gates elsewhere
-                        #         → mildly attract it toward the boundary for future routing.
-                        # --------------------------------------------------------------
-                        elif in_full:
-                            lits_pref = [
-                                var_a(r, P_bounds[r], d, jcol, ion)
-                                for (d, jcol) in boundary_cells
-                            ]
-
-                            if lits_pref:
-                                # Clause satisfied (no cost) if ion is TRUE in *some* boundary cell.
-                                # Violated (cost) if ion is interior-only.
-                                add_soft(
-                                    lits_pref,
-                                    weight=min(wB_col if wB_col > 0 else wB_row,
-                                               wB_row if wB_row > 0 else wB_col),
+                        cells = _band_cells_for_dirs(enforced_dirs)
+                        if not cells:
+                            union_cells: Set[Tuple[int, int]] = set()
+                            for direction in enforced_dirs:
+                                union_cells.update(_band_cells_for_dirs({direction}))
+                            cells = list(union_cells)
+                        if not cells:
+                            if DEBUG_DIAG:
+                                print(
+                                    f"[CROSS_BOUNDARY] no valid cells for ion {ion} round {r} dirs={sorted(enforced_dirs)}; skipping",
+                                    flush=True,
                                 )
+                            continue
+                        clause = [var_a(r, P_final, d, c, ion) for (d, c) in cells]
+                        add_hard(clause, "CROSS_BOUNDARY")
 
             # -------------------------------
             # Per-round pass usage helpers (u) and global Σ_r P_r bound
@@ -1354,44 +1538,124 @@ class GlobalReconfigurations(Operation):
             n_sub: int,
             m_sub: int,
             R: int,
-            P_bound: int,
+            P_bound: Union[int, Sequence[int]],
+            inner_pairs: Optional[List[List[Tuple[int, int]]]] = None,
+            outer_pairs: Optional[List[List[Tuple[int, int]]]] = None,
+            boundary_adjacent: Optional[Dict[str, bool]] = None,
         ) -> Dict[str, Any]:
-            mset = {l for l in model if l > 0}
-            def lit_true(lit: int) -> bool:
-                return lit in mset
+            """
+            Patch-aware boundary stats. Counts how often ions involved in gates land
+            on boundaries that actually have adjacent patches.
+            """
+            model_set = {l for l in model if l > 0}
 
-            # boundaries of the *current* subgrid
+            def lit_true(v: int) -> bool:
+                return v in model_set
+
+            if isinstance(P_bound, int):
+                P_bounds = [P_bound] * R
+            else:
+                P_bounds = list(P_bound)
+                if len(P_bounds) != R:
+                    raise ValueError(
+                        f"wise_debug_boundary_stats: len(P_bounds)={len(P_bounds)} != R={R}"
+                    )
+
             last_row = n_sub - 1
             last_col = m_sub - 1
+
+            if boundary_adjacent is None:
+                boundary_adjacent = {
+                    "top": True,
+                    "bottom": True,
+                    "left": True,
+                    "right": True,
+                }
+            else:
+                boundary_adjacent = {
+                    "top": bool(boundary_adjacent.get("top", False)),
+                    "bottom": bool(boundary_adjacent.get("bottom", False)),
+                    "left": bool(boundary_adjacent.get("left", False)),
+                    "right": bool(boundary_adjacent.get("right", False)),
+                }
 
             total_positions = 0
             boundary_hits_row = 0
             boundary_hits_col = 0
             boundary_hits_corner = 0
 
-            # per-ion counts
-            per_ion_counts: Dict[int, Dict[str, int]] = {
-                ion: {"total": 0, "row": 0, "col": 0, "corner": 0}
+            per_ion_counts: Dict[int, Dict[str, Any]] = {
+                ion: {
+                    "total": 0,
+                    "row": 0,
+                    "col": 0,
+                    "corner": 0,
+                    "inner_hits": 0,
+                    "outer_hits": 0,
+                }
                 for ion in ions
             }
 
+            ions_set = set(ions)
+
             for r in range(R):
-                iongates=P_arr[r]
-                ionset = set()
-                for (i1, i2) in iongates:
-                    ionset.add(i1)
-                    ionset.add(i2)
-                for ion in ionset:
+                ions_r: Set[int] = set()
+                if inner_pairs is not None and r < len(inner_pairs):
+                    for (i1, i2) in inner_pairs[r]:
+                        ions_r.add(i1)
+                        ions_r.add(i2)
+                if outer_pairs is not None and r < len(outer_pairs):
+                    for (i1, i2) in outer_pairs[r]:
+                        ions_r.add(i1)
+                        ions_r.add(i2)
+                if not ions_r:
+                    ions_r = ions_set
+                else:
+                    ions_r &= ions_set
+
+                if not ions_r:
+                    continue
+
+                inner_ions_r: Set[int] = set()
+                outer_ions_r: Set[int] = set()
+                if inner_pairs is not None and r < len(inner_pairs):
+                    for (i1, i2) in inner_pairs[r]:
+                        inner_ions_r.add(i1)
+                        inner_ions_r.add(i2)
+                if outer_pairs is not None and r < len(outer_pairs):
+                    for (i1, i2) in outer_pairs[r]:
+                        outer_ions_r.add(i1)
+                        outer_ions_r.add(i2)
+
+                p_final = P_bounds[r]
+
+                for ion in ions_r:
+                    if ion not in per_ion_counts:
+                        per_ion_counts[ion] = {
+                            "total": 0,
+                            "row": 0,
+                            "col": 0,
+                            "corner": 0,
+                            "inner_hits": 0,
+                            "outer_hits": 0,
+                        }
                     for d in range(n_sub):
                         for c in range(m_sub):
-                            v = var_a(r+1, 0, d, c, ion)
+                            v = var_a(r, p_final, d, c, ion)
                             if not lit_true(v):
                                 continue
+
                             total_positions += 1
                             per_ion_counts[ion]["total"] += 1
 
-                            on_row_boundary = (d == last_row)
-                            on_col_boundary = (c == last_col)
+                            on_top = (d == 0 and boundary_adjacent["top"])
+                            on_bottom = (d == last_row and boundary_adjacent["bottom"])
+                            on_left = (c == 0 and boundary_adjacent["left"])
+                            on_right = (c == last_col and boundary_adjacent["right"])
+
+                            on_row_boundary = on_top or on_bottom
+                            on_col_boundary = on_left or on_right
+
                             if on_row_boundary:
                                 boundary_hits_row += 1
                                 per_ion_counts[ion]["row"] += 1
@@ -1402,40 +1666,40 @@ class GlobalReconfigurations(Operation):
                                 boundary_hits_corner += 1
                                 per_ion_counts[ion]["corner"] += 1
 
-            # Avoid div-by-zero
-            total_positions = max(total_positions, 1)
+                            if ion in inner_ions_r:
+                                per_ion_counts[ion]["inner_hits"] += 1
+                            if ion in outer_ions_r:
+                                per_ion_counts[ion]["outer_hits"] += 1
 
-            frac_row = boundary_hits_row / total_positions
-            frac_col = boundary_hits_col / total_positions
-            frac_corner = boundary_hits_corner / total_positions
+            total_positions = max(total_positions, 1)
 
             summary = {
                 "label": label,
                 "n_sub": n_sub,
                 "m_sub": m_sub,
                 "R": R,
-                "P_bound": P_bound,
+                "P_bounds": P_bounds,
                 "total_positions": total_positions,
                 "boundary_hits_row": boundary_hits_row,
                 "boundary_hits_col": boundary_hits_col,
                 "boundary_hits_corner": boundary_hits_corner,
-                "frac_row": frac_row,
-                "frac_col": frac_col,
-                "frac_corner": frac_corner,
+                "frac_row": boundary_hits_row / total_positions,
+                "frac_col": boundary_hits_col / total_positions,
+                "frac_corner": boundary_hits_corner / total_positions,
+                "boundary_adjacent": boundary_adjacent,
                 "per_ion_counts": per_ion_counts,
             }
 
-            # Compact, grep-able log line
             print(
                 f"[WISE-DEBUG] boundary-stats {label}: "
                 f"subgrid={n_sub}x{m_sub}, "
                 f"pos={total_positions}, "
-                f"row_hits={boundary_hits_row} ({frac_row:.3f}), "
-                f"col_hits={boundary_hits_col} ({frac_col:.3f}), "
-                f"corner_hits={boundary_hits_corner} ({frac_corner:.3f})"
+                f"row_hits={boundary_hits_row} ({summary['frac_row']:.3f}), "
+                f"col_hits={boundary_hits_col} ({summary['frac_col']:.3f}), "
+                f"corner_hits={boundary_hits_corner} ({summary['frac_corner']:.3f}), "
+                f"adjacent={boundary_adjacent}"
             )
 
-            # Optionally, also print worst-offending ions (top few):
             worst = sorted(
                 per_ion_counts.items(),
                 key=lambda kv: (kv[1]["row"] + kv[1]["col"]),
@@ -1450,7 +1714,9 @@ class GlobalReconfigurations(Operation):
                     f"[WISE-DEBUG]   ion {ion}: total={stats['total']}, "
                     f"row={stats['row']} ({fr:.3f}), "
                     f"col={stats['col']} ({fc:.3f}), "
-                    f"corner={stats['corner']}"
+                    f"corner={stats['corner']}, "
+                    f"inner_hits={stats['inner_hits']}, "
+                    f"outer_hits={stats['outer_hits']}"
                 )
 
             return summary
@@ -1459,17 +1725,45 @@ class GlobalReconfigurations(Operation):
             P_min: int,
             P_max_limit: int,
             step: int = 1,
-        ) -> Iterable[int]:
+            *,
+            capacity_steps: int = 6,
+            capacity_min: float = 0.0,
+        ) -> Iterable[Tuple[int, float]]:
+            """
+            Enumerate (P_max, boundary_capacity_factor) pairs. The capacity factor
+            scales the number of ions that are forced into boundary bands for
+            CROSS_BOUNDARY constraints. The final factor is capacity_min (typically 0).
+            """
+            if capacity_steps <= 1:
+                factors = [1.0]
+            else:
+                factors = [
+                    max(
+                        capacity_min,
+                        1.0 - i * (1.0 - capacity_min) / (capacity_steps - 1),
+                    )
+                    for i in range(capacity_steps)
+                ]
+
             for P_max in range(P_min, P_max_limit + 1, max(1, step)):
-                yield P_max
+                for factor in factors:
+                    yield (P_max, factor)
 
         chosen_solution = None
         base_pmax = max(max(base_pmax_in, 1), prev_pmax)
         limit_pmax = base_pmax + n + m
-        configs = _enumerate_pmax_configs(base_pmax, limit_pmax, step=1)
+        configs = _enumerate_pmax_configs(
+            base_pmax,
+            limit_pmax,
+            step=max(int(np.floor((limit_pmax-base_pmax)/4)),1),
+            capacity_steps=6,
+            capacity_min=0.0,
+        )
 
-        for P_max in configs:
-            rounds_under_sum_local = max(0, R - optimize_round_start)
+        chosen_boundary_capacity_factor = 1.0
+
+        for (P_max, boundary_capacity_factor) in configs:
+            rounds_under_sum_local = max(1, R - optimize_round_start)
             B_lo = 0
             B_hi = rounds_under_sum_local * P_max
             sum_star = None
@@ -1477,7 +1771,8 @@ class GlobalReconfigurations(Operation):
             if DEBUG_DIAG:
                 print(
                     f"[WISE] starting binary search for ΣP in [{B_lo}, {B_hi}] "
-                    f"(opt rounds start={optimize_round_start}) with P_max={P_max}",
+                    f"(opt rounds start={optimize_round_start}) with P_max={P_max}, "
+                    f"boundary_capacity_factor={boundary_capacity_factor:.2f}",
                     flush=True,
                 )
 
@@ -1500,7 +1795,10 @@ class GlobalReconfigurations(Operation):
                     optimize_round_start=optimize_round_start,
                     debug_core=True,
                     core_granularity="coarse",
-                    debug_skip_cardinality=False
+                    debug_skip_cardinality=False,
+                    boundary_adjacent=boundary_adjacent,
+                    cross_boundary_prefs=cross_boundary_prefs,
+                    boundary_capacity_factor=boundary_capacity_factor,
                 )
 
                 assumptions_mid = (
@@ -1516,7 +1814,7 @@ class GlobalReconfigurations(Operation):
                 )
 
                 # with Minisat22(bootstrap_with=cnf_mid.clauses) as sat:
-                #     sat_ok = sat.solve()
+                #     sat_ok = sat.solve(assumptions=assumptions_mid)
                 #     model_mid = sat.get_model() if sat_ok else None
                 #     status_sat = "ok" if sat_ok else "error"
                 t_sat_end = time.time()
@@ -1534,99 +1832,110 @@ class GlobalReconfigurations(Operation):
                     )
                  
                 if sat_ok:
-                    chosen_solution = (cnf_mid, vpool_mid, ions_mid, var_a_mid, model_mid, B_mid, P_max)
+                    chosen_solution = (
+                        cnf_mid,
+                        vpool_mid,
+                        ions_mid,
+                        var_a_mid,
+                        model_mid,
+                        B_mid,
+                        P_max,
+                        boundary_capacity_factor,
+                    )
+                    chosen_boundary_capacity_factor = boundary_capacity_factor
                     # Record this as the best so far and tighten upper bound
                     sum_star = B_mid
                     B_hi = B_mid - 1
                 else:
-                    if sat_ok is False and grp_sel_mid and False :
-                        try:
-                            with Minisat22(bootstrap_with=cnf_mid.clauses) as s:
-                                assumptions = [-lit for lit in grp_sel_mid.values()]
-                                ok = s.solve(assumptions=assumptions)
-                                if not ok:
-                                    core = s.get_core() or []
-                                    inv = {lit: name for name, lit in grp_sel_mid.items()}
+                    # try:
+                    #     with Minisat22(bootstrap_with=cnf_mid.clauses) as s:
+                    #         assumptions = [-lit for lit in grp_sel_mid.values()]
+                    #         ok = s.solve(assumptions=assumptions)
+                    #         if not ok:
+                    #             core = s.get_core() or []
+                    #             inv = {lit: name for name, lit in grp_sel_mid.items()}
 
-                                    by_group: Dict[str, Set[int]] = {}
-                                    culprit_rounds: Set[int] = set()
-                                    culprit_fullnames: List[str] = []
+                    #             by_group: Dict[str, Set[int]] = {}
+                    #             culprit_rounds: Set[int] = set()
+                    #             culprit_fullnames: List[str] = []
 
-                                    for a in core:
-                                        var = abs(a)
-                                        fullname = inv.get(var)
-                                        if fullname is None:
-                                            continue
-                                        culprit_fullnames.append(fullname)
-                                        parts = fullname.split(":")
-                                        base = parts[0]
+                    #             for a in core:
+                    #                 var = abs(a)
+                    #                 fullname = inv.get(var)
+                    #                 if fullname is None:
+                    #                     continue
+                    #                 culprit_fullnames.append(fullname)
+                    #                 parts = fullname.split(":")
+                    #                 base = parts[0]
 
-                                        rounds_here: Set[int] = set()
-                                        for part in parts[1:]:
-                                            if part.startswith("r"):
-                                                try:
-                                                    rounds_here.add(int(part[1:]))
-                                                except ValueError:
-                                                    pass
+                    #                 rounds_here: Set[int] = set()
+                    #                 for part in parts[1:]:
+                    #                     if part.startswith("r"):
+                    #                         try:
+                    #                             rounds_here.add(int(part[1:]))
+                    #                         except ValueError:
+                    #                             pass
 
-                                        if rounds_here:
-                                            by_group.setdefault(base, set()).update(rounds_here)
-                                            culprit_rounds.update(rounds_here)
-                                        else:
-                                            by_group.setdefault(base, set())
+                    #                 if rounds_here:
+                    #                     by_group.setdefault(base, set()).update(rounds_here)
+                    #                     culprit_rounds.update(rounds_here)
+                    #                 else:
+                    #                     by_group.setdefault(base, set())
 
-                                    # High-level summary
-                                    print(f"[UNSAT-CORE] ΣP={B_mid} → groups:", flush=True)
-                                    for base in sorted(by_group.keys()):
-                                        rs = sorted(by_group[base])
-                                        if rs:
-                                            msg = f"  {base}: rounds {rs[0]}..{rs[-1]} (|R|={len(rs)})"
-                                        else:
-                                            msg = f"  {base}: no round tag"
-                                        print(msg, flush=True)
+                    #             # High-level summary
+                    #             print(f"[UNSAT-CORE] ΣP={B_mid} → groups:", flush=True)
+                    #             for base in sorted(by_group.keys()):
+                    #                 rs = sorted(by_group[base])
+                    #                 if rs:
+                    #                     msg = f"  {base}: rounds {rs[0]}..{rs[-1]} (|R|={len(rs)})"
+                    #                 else:
+                    #                     msg = f"  {base}: no round tag"
+                    #                 print(msg, flush=True)
 
-                                    if culprit_rounds:
-                                        print(
-                                            f"[UNSAT-CORE] culprit rounds (union): {sorted(culprit_rounds)}",
-                                            flush=True,
-                                        )
+                    #             if culprit_rounds:
+                    #                 print(
+                    #                     f"[UNSAT-CORE] culprit rounds (union): {sorted(culprit_rounds)}",
+                    #                     flush=True,
+                    #                 )
 
-                                    # Brief per-round context (only first few rounds)
-                                    for r_bad in sorted(culprit_rounds)[:5]:
-                                        if 0 <= r_bad < len(P_arr):
-                                            print(
-                                                f"[UNSAT-CORE]   r={r_bad}, |P_arr[{r_bad}]| = {len(P_arr[r_bad])}",
-                                                flush=True,
-                                            )
-                                        if 0 <= r_bad < len(BT):
-                                            print(
-                                                f"[UNSAT-CORE]   r={r_bad}, |BT[{r_bad}]|    = {len(BT[r_bad])}",
-                                                flush=True,
-                                            )
+                    #             # Brief per-round context (only first few rounds)
+                    #             for r_bad in sorted(culprit_rounds)[:5]:
+                    #                 if 0 <= r_bad < len(P_arr):
+                    #                     print(
+                    #                         f"[UNSAT-CORE]   r={r_bad}, |P_arr[{r_bad}]| = {len(P_arr[r_bad])}",
+                    #                         flush=True,
+                    #                     )
+                    #                 if 0 <= r_bad < len(BT):
+                    #                     print(
+                    #                         f"[UNSAT-CORE]   r={r_bad}, |BT[{r_bad}]|    = {len(BT[r_bad])}",
+                    #                         flush=True,
+                    #                     )
 
-                                    culprit_bases = set(by_group.keys())
-                                    hints = []
-                                    if "PAIR_REQ" in culprit_bases:
-                                        hints.append("PAIR_REQ (check BT vs P_arr)")
-                                    if "CARD_CELL" in culprit_bases or "CARD_ION" in culprit_bases:
-                                        hints.append("CARD_* (global permutation)")
-                                    if "PHASE_MONO" in culprit_bases:
-                                        hints.append("PHASE_MONO (phase monotonicity)")
-                                    if "H_GATE" in culprit_bases or "V_GATE" in culprit_bases:
-                                        hints.append("H_GATE/V_GATE (parity/gating)")
-                                    if "ROWBLOCK_LINK" in culprit_bases:
-                                        hints.append("ROWBLOCK_LINK (row/block linkage vs BT/pairs)")
+                    #             culprit_bases = set(by_group.keys())
+                    #             hints = []
+                    #             if "PAIR_REQ" in culprit_bases:
+                    #                 hints.append("PAIR_REQ (check BT vs P_arr)")
+                    #             if "CARD_CELL" in culprit_bases or "CARD_ION" in culprit_bases:
+                    #                 hints.append("CARD_* (global permutation)")
+                    #             if "PHASE_MONO" in culprit_bases:
+                    #                 hints.append("PHASE_MONO (phase monotonicity)")
+                    #             if "H_GATE" in culprit_bases or "V_GATE" in culprit_bases:
+                    #                 hints.append("H_GATE/V_GATE (parity/gating)")
+                    #             if "ROWBLOCK_LINK" in culprit_bases:
+                    #                 hints.append("ROWBLOCK_LINK (row/block linkage vs BT/pairs)")
+                    #             if "CROSS_BOUNDARY" in culprit_bases:
+                    #                 hints.append("CROSS_BOUNDARY (cross-patch boundary bands / prefs)")
 
-                                    if hints:
-                                        print("[UNSAT-CORE] key groups in core:", ", ".join(hints), flush=True)
+                    #             if hints:
+                    #                 print("[UNSAT-CORE] key groups in core:", ", ".join(hints), flush=True)
 
-                                else:
-                                    print(
-                                        "[UNSAT-CORE] Unexpected: SAT under assumptions while previous solver said UNSAT.",
-                                        flush=True,
-                                    )
-                        except Exception as e:
-                            print(f"[UNSAT-CORE] core extraction error: {e}", flush=True)
+                    #         else:
+                    #             print(
+                    #                 "[UNSAT-CORE] Unexpected: SAT under assumptions while previous solver said UNSAT.",
+                    #                 flush=True,
+                    #             )
+                    # except Exception as e:
+                    #     print(f"[UNSAT-CORE] core extraction error: {e}", flush=True)
                     # UNSAT: need more passes in aggregate
                     B_lo = B_mid + 1
             
@@ -1635,13 +1944,112 @@ class GlobalReconfigurations(Operation):
         
 
         if sum_star is None:
-            raise RuntimeError("No feasible layout for any Σ_r P_r bound in [0, R * P_max].")
+            # try:
+            #     with Minisat22(bootstrap_with=cnf_mid.clauses) as s:
+            #         assumptions = [-lit for lit in grp_sel_mid.values()]
+            #         ok = s.solve(assumptions=assumptions)
+            #         if not ok:
+            #             core = s.get_core() or []
+            #             inv = {lit: name for name, lit in grp_sel_mid.items()}
 
-        _, vpool_sat, ions_sat, var_a_sat, sat_model_star, best_sum_bound, P_max = chosen_solution
+            #             by_group: Dict[str, Set[int]] = {}
+            #             culprit_rounds: Set[int] = set()
+            #             culprit_fullnames: List[str] = []
+
+            #             for a in core:
+            #                 var = abs(a)
+            #                 fullname = inv.get(var)
+            #                 if fullname is None:
+            #                     continue
+            #                 culprit_fullnames.append(fullname)
+            #                 parts = fullname.split(":")
+            #                 base = parts[0]
+
+            #                 rounds_here: Set[int] = set()
+            #                 for part in parts[1:]:
+            #                     if part.startswith("r"):
+            #                         try:
+            #                             rounds_here.add(int(part[1:]))
+            #                         except ValueError:
+            #                             pass
+
+            #                 if rounds_here:
+            #                     by_group.setdefault(base, set()).update(rounds_here)
+            #                     culprit_rounds.update(rounds_here)
+            #                 else:
+            #                     by_group.setdefault(base, set())
+
+            #             # High-level summary
+            #             print(f"[UNSAT-CORE] ΣP={B_mid} → groups:", flush=True)
+            #             for base in sorted(by_group.keys()):
+            #                 rs = sorted(by_group[base])
+            #                 if rs:
+            #                     msg = f"  {base}: rounds {rs[0]}..{rs[-1]} (|R|={len(rs)})"
+            #                 else:
+            #                     msg = f"  {base}: no round tag"
+            #                 print(msg, flush=True)
+
+            #             if culprit_rounds:
+            #                 print(
+            #                     f"[UNSAT-CORE] culprit rounds (union): {sorted(culprit_rounds)}",
+            #                     flush=True,
+            #                 )
+
+            #             # Brief per-round context (only first few rounds)
+            #             for r_bad in sorted(culprit_rounds)[:5]:
+            #                 if 0 <= r_bad < len(P_arr):
+            #                     print(
+            #                         f"[UNSAT-CORE]   r={r_bad}, |P_arr[{r_bad}]| = {len(P_arr[r_bad])}",
+            #                         flush=True,
+            #                     )
+            #                 if 0 <= r_bad < len(BT):
+            #                     print(
+            #                         f"[UNSAT-CORE]   r={r_bad}, |BT[{r_bad}]|    = {len(BT[r_bad])}",
+            #                         flush=True,
+            #                     )
+
+            #             culprit_bases = set(by_group.keys())
+            #             hints = []
+            #             if "PAIR_REQ" in culprit_bases:
+            #                 hints.append("PAIR_REQ (check BT vs P_arr)")
+            #             if "CARD_CELL" in culprit_bases or "CARD_ION" in culprit_bases:
+            #                 hints.append("CARD_* (global permutation)")
+            #             if "PHASE_MONO" in culprit_bases:
+            #                 hints.append("PHASE_MONO (phase monotonicity)")
+            #             if "H_GATE" in culprit_bases or "V_GATE" in culprit_bases:
+            #                 hints.append("H_GATE/V_GATE (parity/gating)")
+            #             if "ROWBLOCK_LINK" in culprit_bases:
+            #                 hints.append("ROWBLOCK_LINK (row/block linkage vs BT/pairs)")
+            #             if "CROSS_BOUNDARY" in culprit_bases:
+            #                 hints.append("CROSS_BOUNDARY (cross-patch boundary bands / prefs)")
+
+            #             if hints:
+            #                 print("[UNSAT-CORE] key groups in core:", ", ".join(hints), flush=True)
+
+            #         else:
+            #             print(
+            #                 "[UNSAT-CORE] Unexpected: SAT under assumptions while previous solver said UNSAT.",
+            #                 flush=True,
+            #             )
+            # except Exception as e:
+            #     print(f"[UNSAT-CORE] core extraction error: {e}", flush=True)
+            raise NoFeasibleLayoutError("No feasible layout for any Σ_r P_r bound in [0, R * P_max].")
+
+        (
+            _,
+            vpool_sat,
+            ions_sat,
+            var_a_sat,
+            sat_model_star,
+            best_sum_bound,
+            P_max,
+            chosen_boundary_capacity_factor,
+        ) = chosen_solution
         if DEBUG_DIAG:
             print(f"[WISE] minimal ΣP found: {best_sum_bound} (P_max={P_max})", flush=True)
 
         pass_horizon = P_max
+        P_bounds = ([pass_horizon + n + m] * optimize_round_start + [pass_horizon] * (R - optimize_round_start))
 
         layouts_before: List[np.ndarray] = []
         cur = A_in.copy()
@@ -1672,70 +2080,79 @@ class GlobalReconfigurations(Operation):
             n_sub=n,
             m_sub=m,
             R=R,
-            P_bound=pass_horizon,
+            P_bound=P_bounds,
+            inner_pairs=P_arr,
+            outer_pairs=outer_pairs,
+            boundary_adjacent=boundary_adjacent,
         )
         # -------------------------------
         # Level 3: MaxSAT refinement under ΣP*
         # -------------------------------
-        if DEBUG_DIAG:
-            print(
-                f"[WISE] building WCNF at ΣP*={best_sum_bound}, P_max={pass_horizon} for MaxSAT...",
-                flush=True,
-            )
-
-        t_build_start = time.time()
-        wcnf, vpool_w, ions_w, var_a_w, _, _ = _build_structural_cnf(
-            pass_horizon,
-            sum_bound_B=best_sum_bound,
-            use_wcnf=True,
-            add_boundary_soft=True,
-            phase_label=f"ΣP*={best_sum_bound}/WCNF",
-            optimize_round_start=optimize_round_start,
-            debug_skip_cardinality=False
-        )
-        t_build_end = time.time()
-
-        if DEBUG_DIAG:
-            print(
-                f"[WISE] WCNF built: vars={wcnf.nv}, hard={len(wcnf.hard)}, "
-                f"soft={len(wcnf.soft)}, time={t_build_end - t_build_start:.3f}s",
-                flush=True,
-            )
-
-        model_rc2, cost_rc2, status_rc2 = run_rc2_with_timeout_file(
-            wcnf,
-            timeout_s=max_rc2_time,
-            debug_prefix="[WISE]",
-        )
-        # rc2 = RC2(wcnf)
-        # model_rc2 = rc2.compute()
-        # cost_rc2 = rc2.cost if model_rc2 is not None else None
-        # status_rc2 = "ok" if model_rc2 is not None else "error"
-
-        if DEBUG_DIAG:
-            print(
-                f"[WISE] RC2 status={status_rc2}, opt_cost={cost_rc2}",
-                flush=True,
-            )
-
-        if status_rc2 == "ok" and model_rc2 is not None:
-            model_used = model_rc2
-            vpool_used = vpool_w
-            var_a_used = var_a_w
-            ions_used = ions_w
+        ENABLE_MAXSAT = False
+        if ENABLE_MAXSAT:
             if DEBUG_DIAG:
-                print("[WISE] using RC2 MaxSAT model at P*", flush=True)
+                print(
+                    f"[WISE] building WCNF at ΣP*={best_sum_bound}, P_max={pass_horizon} for MaxSAT...",
+                    flush=True,
+                )
+            t_build_start = time.time()
+            wcnf, vpool_w, ions_w, var_a_w, _, _ = _build_structural_cnf(
+                pass_horizon,
+                sum_bound_B=best_sum_bound,
+                use_wcnf=True,
+                add_boundary_soft=True,
+                phase_label=f"ΣP*={best_sum_bound}/WCNF",
+                optimize_round_start=optimize_round_start,
+                debug_skip_cardinality=False,
+                boundary_adjacent=boundary_adjacent,
+                cross_boundary_prefs=cross_boundary_prefs,
+                boundary_capacity_factor=chosen_boundary_capacity_factor,
+            )
+            t_build_end = time.time()
+
+            if DEBUG_DIAG:
+                print(
+                    f"[WISE] WCNF built: vars={wcnf.nv}, hard={len(wcnf.hard)}, "
+                    f"soft={len(wcnf.soft)}, time={t_build_end - t_build_start:.3f}s",
+                    flush=True,
+                )
+
+            rc2 = RC2(wcnf)
+            model_rc2 = rc2.compute()
+            cost_rc2 = rc2.cost if model_rc2 is not None else None
+            status_rc2 = "ok" if model_rc2 is not None else "error"
+
+            if DEBUG_DIAG:
+                print(
+                    f"[WISE] RC2 status={status_rc2}, opt_cost={cost_rc2}",
+                    flush=True,
+                )
+
+            if status_rc2 == "ok" and model_rc2 is not None:
+                model_used = model_rc2
+                vpool_used = vpool_w
+                var_a_used = var_a_w
+                ions_used = ions_w
+                if DEBUG_DIAG:
+                    print("[WISE] using RC2 MaxSAT model at P*", flush=True)
+            else:
+                model_used = sat_model_star
+                vpool_used = vpool_sat
+                var_a_used = var_a_sat
+                ions_used = ions_sat
+                if DEBUG_DIAG:
+                    print(
+                        "[WISE] MaxSAT unavailable (timeout/error); "
+                        "falling back to SAT model at P*.",
+                        flush=True,
+                    )
         else:
             model_used = sat_model_star
             vpool_used = vpool_sat
             var_a_used = var_a_sat
             ions_used = ions_sat
             if DEBUG_DIAG:
-                print(
-                    "[WISE] MaxSAT unavailable (timeout/error); "
-                    "falling back to SAT model at P*.",
-                    flush=True,
-                )
+                print("[WISE] MaxSAT disabled; using SAT model at P*", flush=True)
 
         # Decide which ions are "core" for this slice.
         # A reasonable default: all active ions that lie entirely in the current subgrid.
@@ -1747,11 +2164,14 @@ class GlobalReconfigurations(Operation):
             model=model_used,
             vpool=vpool_used,
             var_a=var_a_used,
-            ions=ions,
+            ions=ions_used,
             n_sub=n,
             m_sub=m,
             R=R,
-            P_bound=pass_horizon,
+            P_bound=P_bounds,
+            inner_pairs=P_arr,
+            outer_pairs=outer_pairs,
+            boundary_adjacent=boundary_adjacent,
         )
 
 
@@ -1759,7 +2179,6 @@ class GlobalReconfigurations(Operation):
         # Decode layouts a[r,P_max] from model_used
         # -------------------------------
         model_set = {lit for lit in model_used if lit > 0}
-        P_bounds = ([pass_horizon+n+m]*optimize_round_start + [pass_horizon]*(R-optimize_round_start))
 
         def lit_true(v: int) -> bool:
             return v in model_set
@@ -1793,10 +2212,23 @@ class GlobalReconfigurations(Operation):
             R=R,
             P_bound=pass_horizon,
         )
+
+        row_offset, col_offset = grid_origin
+        if row_offset != 0 or col_offset != 0:
+            for round_schedule in schedule:
+                for pass_info in round_schedule:
+                    if "h_swaps" in pass_info:
+                        pass_info["h_swaps"] = [
+                            (r + row_offset, c + col_offset) for (r, c) in pass_info["h_swaps"]
+                        ]
+                    if "v_swaps" in pass_info:
+                        pass_info["v_swaps"] = [
+                            (r + row_offset, c + col_offset) for (r, c) in pass_info["v_swaps"]
+                        ]
         # print(schedule)
         per_round_z = extract_round_pass_usage(
-            sat_model_star,
-            vpool_sat,
+            model_used,
+            vpool_used,
             R,
             pass_horizon,
         )
