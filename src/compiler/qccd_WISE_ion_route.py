@@ -12,6 +12,8 @@ from collections import defaultdict
 import copy
 import os
 import time
+import logging
+from copy import deepcopy
 
 import numpy as np
 
@@ -25,6 +27,12 @@ from src.compiler.qccd_qubits_to_ions import *
 
 PATCH_LOG_PREFIX = "[PatchRoute]"
 PATCH_VERBOSE_MOVES = os.environ.get("WISE_PATCH_VERBOSE", "0") not in ("0", "")
+
+LOGGER_NAME = "wise.qccd.route"
+logger = logging.getLogger(LOGGER_NAME)
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
+logger.propagate = False
 
 def _compute_patch_gating_capacity(
     n: int,
@@ -346,7 +354,8 @@ def _patch_and_route(
     active_ions: List[int] = None,
     ignore_initial_reconfig: bool = False,
     base_pmax_in: int = None,
-) -> List[List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]]:
+    BTs: Optional[List[Dict[Tuple[int, int], Tuple[Dict[int, Tuple[int, int]], List[Tuple[int, int]]]]]] = None,
+) -> List[Tuple[int, int, List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]]]:
     """
     Patch-based Level-1 slicer. Partition the device into checkerboard patches and
     solve each patch locally via _optimal_QMR_for_WISE. Multiple tiling phases are
@@ -377,7 +386,7 @@ def _patch_and_route(
     base_pmax = base_pmax_in or R
     prev_pmax = None
 
-    tiling_steps: List[List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]] = []
+    tiling_steps: List[Tuple[int, int, List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]]] = []
 
     max_cycles = 10
     no_progress_cycles = 0
@@ -428,13 +437,22 @@ def _patch_and_route(
             ):
                 tilings.append((0, half_w))
 
-        print(
-            f"{PATCH_LOG_PREFIX} starting patch routing: rounds={R}, total_gates={total_remaining}, "
-            f"patch_size={patch_h}x{patch_w}, tilings={len(tilings)}"
+        logger.info(
+            "%s starting patch routing: rounds=%d, total_gates=%d, patch_size=%dx%d, tilings=%d, BTs=%s",
+            PATCH_LOG_PREFIX,
+            R,
+            total_remaining,
+            patch_h,
+            patch_w,
+            len(tilings),
+            BTs
         )
 
-        print(
-            f"{PATCH_LOG_PREFIX} beginning tiling cycle {cycle_idx + 1}; remaining_gates={total_remaining}"
+        logger.info(
+            "%s beginning tiling cycle %d; remaining_gates=%d",
+            PATCH_LOG_PREFIX,
+            cycle_idx + 1,
+            total_remaining,
         )
         cycle_start_remaining = total_remaining
 
@@ -453,10 +471,43 @@ def _patch_and_route(
             pairs_before_tiling: List[List[Tuple[int, int]]] = [list(rp) for rp in remaining_pairs]
 
             patch_regions = _generate_patch_regions(n_rows, n_cols, patch_h, patch_w, off_r, off_c)
-            print(
-                f"{PATCH_LOG_PREFIX} cycle {cycle_idx + 1} tiling {tiling_idx + 1}/{len(tilings)} "
-                f"offset=({off_r},{off_c}) patches={len(patch_regions)} remaining_before={gates_before_tiling}"
+            logger.info(
+                "%s cycle %d tiling %d/%d offset=(%d,%d) patches=%d remaining_before=%d",
+                PATCH_LOG_PREFIX,
+                cycle_idx + 1,
+                tiling_idx + 1,
+                len(tilings),
+                off_r,
+                off_c,
+                len(patch_regions),
+                gates_before_tiling,
             )
+
+            # Determine BT pins for this tiling, if provided.
+            if BTs is not None and BTs:
+                key = (cycle_idx, tiling_idx)
+                BT_for_tiling: List[Dict[int, Tuple[int, int]]] = []
+                pairs_for_tiling: List[Set[Tuple[int, int]]] = []
+                for r in range(R):
+                    entry = None
+                    if r < len(BTs):
+                        entry = BTs[r].get(key)
+                    if isinstance(entry, tuple):
+                        bt_map_full, solved_pairs_full = entry
+                    elif isinstance(entry, dict):
+                        bt_map_full = entry
+                        solved_pairs_full = []
+                    elif entry is None:
+                        bt_map_full = {}
+                        solved_pairs_full = []
+                    else:
+                        bt_map_full = dict(entry)
+                        solved_pairs_full = []
+                    BT_for_tiling.append(bt_map_full)
+                    pairs_for_tiling.append(set(solved_pairs_full))
+            else:
+                BT_for_tiling = [dict() for _ in range(R)]
+                pairs_for_tiling = [set() for _ in range(R)]
 
             patch_schedules_this_tiling: List[List[List[Dict[str, Any]]]] = []
 
@@ -507,12 +558,95 @@ def _patch_and_route(
                 )
 
                 if patch_gate_count == 0 and not has_boundary_prefs:
+                    # No gates to solve in this patch; skip SAT even if boundary prefs exist.
                     remaining_pairs = new_remaining
                     continue
 
-                print(
-                    f"{PATCH_LOG_PREFIX} solving patch r[{r0}:{r1}] c[{c0}:{c1}] "
-                    f"gates={patch_gate_count} per_round={per_round_counts} boundary_prefs={cross_boundary_prefs}"
+                ions_in_patch_pairs = [[] for _ in range(R)]
+                for r, pairs in enumerate(patch_pairs):
+                    for p in pairs:
+                        ions_in_patch_pairs[r].append(p[0])
+                        ions_in_patch_pairs[r].append(p[1])
+
+                ions_in_tiling_pairs = [[] for _ in range(R)]
+                for r, pairs in enumerate(pairs_for_tiling):
+                    for p in pairs:
+                        ions_in_tiling_pairs[r].append(p[0])
+                        ions_in_tiling_pairs[r].append(p[1])
+
+                BT_patch: List[Dict[int, Tuple[int, int]]] = [dict() for _ in range(R)]
+                # Track (start_row_local, target_col_local) → ion we kept, per round
+                bt_keys_used: List[Dict[Tuple[int, int], int]] = [dict() for _ in range(R)]
+                use_bt_softs = False
+                for ridx in range(R):
+                    bt_full = BT_for_tiling[ridx] if ridx < len(BT_for_tiling) else {}
+                    ions_patch = ions_in_patch_pairs[ridx]
+                    ions_tiling = ions_in_tiling_pairs[ridx]
+
+                    for ion, (global_r, global_c) in bt_full.items():
+                        # # Only pin ions that are consistently in/out of this tiling’s pairs
+                        if (ion in ions_patch) != (ion in ions_tiling):
+                            continue
+                        # Only pin ions whose *target* is inside this patch region
+                        if not (r0 <= global_r < r1 and c0 <= global_c < c1):
+                            continue
+
+                        # # Local target coords in this patch
+                        local_r = global_r - r0
+                        local_c = global_c - c0
+
+                        # Compute the ion's *start row* in this patch, to mirror the
+                        # pre-sanity check in _optimal_QMR_for_WISE.
+                        if ridx==0:
+                            init_pos = ion_positions.get(ion)
+                            if init_pos is None:
+                                continue
+                            init_row_global, _ = init_pos
+                            start_row_local = init_row_global - r0
+                            if not (0 <= start_row_local < (r1 - r0)):
+                                # Shouldn't normally happen, but be defensive
+                                continue
+
+                            key = (start_row_local, local_c)
+                            existing_ion = bt_keys_used[ridx].get(key)
+
+                            if existing_ion is not None and existing_ion != ion:
+                                # Conflict: another ion from the same start row already pinned
+                                # to this target column in this patch. To keep BT consistent
+                                # with _optimal_QMR_for_WISE's pre-check, we skip this one.
+                                logger.warning(
+                                    "%s BT pin conflict in patch r[%d:%d] c[%d:%d], round=%d: "
+                                    "start_row_local=%d, target_col_local=%d; keeping ion %d, "
+                                    "dropping ion %d",
+                                    PATCH_LOG_PREFIX,
+                                    r0,
+                                    r1,
+                                    c0,
+                                    c1,
+                                    ridx,
+                                    start_row_local,
+                                    local_c,
+                                    existing_ion,
+                                    ion,
+                                )
+                                continue
+
+                        # No conflict: record and keep the pin.
+                        bt_keys_used[ridx][key] = ion
+                        BT_patch[ridx][ion] = (local_r, local_c)
+                        use_bt_softs=True
+
+                logger.info(
+                    "%s solving patch r[%d:%d] c[%d:%d] gates=%d per_round=%s boundary_prefs=%s, BTs=%s",
+                    PATCH_LOG_PREFIX,
+                    r0,
+                    r1,
+                    c0,
+                    c1,
+                    patch_gate_count,
+                    per_round_counts,
+                    cross_boundary_prefs,
+                    BT_patch
                 )
 
                 patch_start = time.time()
@@ -521,7 +655,7 @@ def _patch_and_route(
                         patch_grid,
                         patch_pairs,
                         k=wiseArch.k,
-                        BT=[{} for _ in range(R)],
+                        BT=BT_patch,
                         active_ions=active_ions,
                         wB_col=0,
                         wB_row=0,
@@ -532,11 +666,19 @@ def _patch_and_route(
                         grid_origin=(r0, c0),
                         boundary_adjacent=boundary_adjacent,
                         cross_boundary_prefs=cross_boundary_prefs,
+                        bt_soft=use_bt_softs
                     )
                 except NoFeasibleLayoutError as exc:
-                    print(
-                        f"{PATCH_LOG_PREFIX} ERROR solving patch r[{r0}:{r1}] c[{c0}:{c1}] max_gate_zones:{max_gating_zones}"
-                        f"gates={patch_gate_count}: {exc}"
+                    logger.warning(
+                        "%s ERROR solving patch r[%d:%d] c[%d:%d] max_gate_zones=%d gates=%d: %s",
+                        PATCH_LOG_PREFIX,
+                        r0,
+                        r1,
+                        c0,
+                        c1,
+                        max_gating_zones,
+                        patch_gate_count,
+                        exc,
                     )
                     # add patch pairs back to our remaining pairs
                     for ridx in range(R):
@@ -564,15 +706,22 @@ def _patch_and_route(
                 move_detail = ", ".join(
                     [f"ion {ion}: {src}->{dst}" for ion, src, dst in moved_ions[:6]]
                 )
-                print(
-                    f"{PATCH_LOG_PREFIX} patch r[{r0}:{r1}] c[{c0}:{c1}] solved in {patch_elapsed:.2f}s; "
-                    f"moved_ions={len(moved_ions)}; details={move_detail if move_detail else 'none'}"
+                logger.info(
+                    "%s patch r[%d:%d] c[%d:%d] solved in %.2fs; moved_ions=%d; details=%s",
+                    PATCH_LOG_PREFIX,
+                    r0,
+                    r1,
+                    c0,
+                    c1,
+                    patch_elapsed,
+                    len(moved_ions),
+                    move_detail if move_detail else "none",
                 )
                 if PATCH_VERBOSE_MOVES and len(moved_ions) > 6:
                     extra_detail = ", ".join(
                         [f"ion {ion}: {src}->{dst}" for ion, src, dst in moved_ions[6:]]
                     )
-                    print(f"{PATCH_LOG_PREFIX} additional moves: {extra_detail}")
+                    logger.debug("%s additional moves: %s", PATCH_LOG_PREFIX, extra_detail)
 
                 for ridx in range(R):
                     layouts_after[ridx][r0:r1, c0:c1] = patch_layouts[ridx]
@@ -594,20 +743,26 @@ def _patch_and_route(
                 (la.copy(), copy.deepcopy(sched), list(sp))
                 for la, sched, sp in zip(layouts_after, merged_tiling_schedule, solved_pairs_per_round)
             ]
-            tiling_steps.append(tiling_snapshot)
+            tiling_steps.append((cycle_idx, tiling_idx, tiling_snapshot))
 
             gates_after_tiling = sum(len(rp) for rp in remaining_pairs)
             solved_this_tiling = gates_before_tiling - gates_after_tiling
-            print(
-                f"{PATCH_LOG_PREFIX} completed tiling {tiling_idx + 1}: "
-                f"solved_gates={solved_this_tiling}, remaining_gates={gates_after_tiling}"
+            logger.info(
+                "%s completed tiling %d: solved_gates=%d, remaining_gates=%d",
+                PATCH_LOG_PREFIX,
+                tiling_idx + 1,
+                solved_this_tiling,
+                gates_after_tiling,
             )
 
         gates_after_cycle = sum(len(rp) for rp in remaining_pairs)
         solved_cycle = cycle_start_remaining - gates_after_cycle
-        print(
-            f"{PATCH_LOG_PREFIX} completed cycle {cycle_idx + 1}: solved={solved_cycle}, "
-            f"remaining={gates_after_cycle}"
+        logger.info(
+            "%s completed cycle %d: solved=%d, remaining=%d",
+            PATCH_LOG_PREFIX,
+            cycle_idx + 1,
+            solved_cycle,
+            gates_after_cycle,
         )
         fully_global_patch = (patch_h >= n_rows) and (patch_w >= n_cols)
         if gates_after_cycle == 0:
@@ -618,8 +773,10 @@ def _patch_and_route(
             # n_r += inc
             no_progress_cycles += 1
             if no_progress_cycles >= max_cycles or fully_global_patch:
-                print(
-                    f"{PATCH_LOG_PREFIX} WARNING: no progress in cycle {cycle_idx + 1}; stopping patch routing loop"
+                logger.warning(
+                    "%s no progress in cycle %d; stopping patch routing loop",
+                    PATCH_LOG_PREFIX,
+                    cycle_idx + 1,
                 )
                 break
         else:
@@ -638,13 +795,14 @@ def _patch_and_route(
                     break
             if len(sample) >= 5:
                 break
-        print(
-            f"{PATCH_LOG_PREFIX} WARNING: {unresolved} gate(s) remain unresolved after patch routing. "
-            f"Example (round, (ion_a, ion_b)): {sample}",
-            flush=True,
+        logger.warning(
+            "%s %d gate(s) remain unresolved after patch routing. Example (round, (ion_a, ion_b)): %s",
+            PATCH_LOG_PREFIX,
+            unresolved,
+            sample,
         )
     else:
-        print(f"{PATCH_LOG_PREFIX} finished patch routing successfully; all gates covered.")
+        logger.info("%s finished patch routing successfully; all gates covered.", PATCH_LOG_PREFIX)
 
     return tiling_steps
 
@@ -656,7 +814,7 @@ def _apply_layout_as_reconfiguration(
     newArrangementArr: np.ndarray,
     layout_after: np.ndarray,
     allOps: List[Operation],
-    schedule: List[Dict[str, Any]],
+    schedule: Optional[List[Dict[str, Any]]]=None,
     initial_placement: bool = False
 ) -> np.ndarray:
     """
@@ -688,7 +846,7 @@ def _apply_layout_as_reconfiguration(
             newArrangement[trap].append(arch.ions[ionidx])
 
     reconfig = GlobalReconfigurations.physicalOperation(
-        newArrangement, wiseArch, oldArrangementArr, newArrangementArr, schedule, initial_placement=initial_placement
+        newArrangement, wiseArch, oldArrangementArr, newArrangementArr, schedule=schedule, initial_placement=initial_placement
     )
     allOps.append(reconfig)
     reconfig.run()
@@ -703,7 +861,8 @@ def ionRoutingWISEArch(
     operations: Sequence[QubitOperation],
     lookahead: int = 2,
     subgridsize: Tuple[int, int, int] = (6, 4, 1), 
-    base_pmax_in: int = None
+    base_pmax_in: int = None,
+    toMoveOps: Sequence[Sequence[TwoQubitMSGate]]= None
 ) -> Tuple[Sequence[Operation], Sequence[int], float]:
     """
     Route a WISE-style QCCD architecture in **three optimisation levels**:
@@ -789,55 +948,68 @@ def ionRoutingWISEArch(
     parallelPairs: List[List[Tuple[int, int]]] = []
     toMoves: List[List[TwoQubitMSGate]] = []
 
-    idx = 0
-    _opstogothrough = list(operations).copy()
 
-    while _opstogothrough:
-        # First, greedily take as many disjoint 1-qubit ops as possible
-        while True:
-            toRemove: List[Operation] = []
-            ionsInvolved: Set[Ion] = set()
+    if toMoveOps is None:
+        idx = 0
+        _opstogothrough = list(operations).copy()
+        while _opstogothrough:
+            # First, greedily take as many disjoint 1-qubit ops as possible
+            while True:
+                toRemove: List[Operation] = []
+                ionsInvolved: Set[Ion] = set()
 
+                for op in _opstogothrough:
+                    trap = op.getTrapForIons()
+                    if ionsInvolved.isdisjoint(op.ions) and len(op.ions) == 1:
+                        toRemove.append(op)
+                    ionsInvolved = ionsInvolved.union(op.ions)
+
+                for g in toRemove:
+                    _opstogothrough.remove(g)
+
+                if len(toRemove) == 0:
+                    break
+
+            # Then, form one round of disjoint 2-qubit MS gates
+            toRemove = []
+            ionsAdded: Set[int] = set()
             for op in _opstogothrough:
-                trap = op.getTrapForIons()
-                if ionsInvolved.isdisjoint(op.ions) and len(op.ions) == 1:
+                if len(op.ions) == 2 and len(toRemove) < parallelismAllowed:
+                    ion1, ion2 = op.ions
+                    ancilla, data = sorted(
+                        (ion1, ion2), key=lambda ion: ion.label[0] == "D"
+                    )
+                    if (ancilla.idx in ionsAdded) or (data.idx in ionsAdded):
+                        continue
                     toRemove.append(op)
-                ionsInvolved = ionsInvolved.union(op.ions)
+                    if idx == len(parallelPairs):
+                        parallelPairs.append([])
+                    parallelPairs[idx].append((ancilla.idx, data.idx))
+                    if idx == len(toMoves):
+                        toMoves.append([])
+                    toMoves[idx].append(op)
+
+                    ionsAdded.add(ancilla.idx)
+                    ionsAdded.add(data.idx)
+                else:
+                    ionsAdded.add(op.ions[0].idx)
 
             for g in toRemove:
                 _opstogothrough.remove(g)
 
-            if len(toRemove) == 0:
-                break
+            idx += int(len(toRemove) > 0)
 
-        # Then, form one round of disjoint 2-qubit MS gates
-        toRemove = []
-        ionsAdded: Set[int] = set()
-        for op in _opstogothrough:
-            if len(op.ions) == 2 and len(toRemove) < parallelismAllowed:
+    else:
+        for toMove in toMoveOps:
+            toMoves.append(list(toMove))
+            parallelPairs.append([])
+            for op in toMove:
                 ion1, ion2 = op.ions
                 ancilla, data = sorted(
                     (ion1, ion2), key=lambda ion: ion.label[0] == "D"
                 )
-                if (ancilla.idx in ionsAdded) or (data.idx in ionsAdded):
-                    continue
-                toRemove.append(op)
-                if idx == len(parallelPairs):
-                    parallelPairs.append([])
-                parallelPairs[idx].append((ancilla.idx, data.idx))
-                if idx == len(toMoves):
-                    toMoves.append([])
-                toMoves[idx].append(op)
+                parallelPairs[-1].append((ancilla.idx, data.idx))
 
-                ionsAdded.add(ancilla.idx)
-                ionsAdded.add(data.idx)
-            else:
-                ionsAdded.add(op.ions[0].idx)
-
-        for g in toRemove:
-            _opstogothrough.remove(g)
-
-        idx += int(len(toRemove) > 0)
 
     # ------------------------------------------------------------------
     # 2) Encode initial ion positions into oldArrangementArr
@@ -861,6 +1033,18 @@ def ionRoutingWISEArch(
 
     active_ions = [ion.idx for ion in ionsSorted if not isinstance(ion, SpectatorIon)]
 
+    logger.info(
+        "%s ionRoutingWISEArch: ops=%d, MS_rounds=%d, lookahead=%d, subgrid=(%d,%d,%d), active_ions=%d",
+        PATCH_LOG_PREFIX,
+        len(operations),
+        len(parallelPairs),
+        lookahead,
+        subgridsize[0],
+        subgridsize[1],
+        subgridsize[2],
+        len(active_ions),
+    )
+
     # # ------------------------------------------------------------------
     # # 3) Initial global reconfiguration via Level-1/2/3 on the first chunk
     # # ------------------------------------------------------------------
@@ -873,34 +1057,216 @@ def ionRoutingWISEArch(
     # )
 
     idx = 0
+    tiling_steps_meta: List[Tuple[int, int, List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]]] = []
     tiling_steps: List[List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]] = []
     tiling_step: List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]] = []
     reconfigTime = 0.0
-    hadMultipleTilingSteps: bool =False
+    hadMultipleTilingSteps: bool = False
+    BTs: Optional[List[Dict[Tuple[int, int], Tuple[Dict[int, Tuple[int, int]], List[Tuple[int, int]]]]]] = None
+    # Cache for repeated routing blocks: map a canonical key for a window of
+    # parallel MS rounds (P_arr) to a mapping from offset within the block to its tiling metadata.
+    block_cache: Dict[
+        Tuple[Tuple[Tuple[int, int], ...], ...],
+        Dict[int, List[Tuple[int, int, List[Tuple[np.ndarray, List[Dict[str, Any]], List[Tuple[int, int]]]]]]]
+    ] = {}
+    # Whether the currently active tiling plan (tiling_steps / tiling_step)
+    # was obtained from the cache. If True, we will replay layouts with
+    # schedule=None so GlobalReconfigurations can treat them as repeats.
+    tiling_steps_from_cache: bool = False
+    # When reusing a cached block, we only want to call
+    # _apply_layout_as_reconfiguration with schedule=None for the *first*
+    # reconfiguration in that block, because the initial layout may differ.
+    # Subsequent steps within the same block occurrence should reuse the
+    # saved schedules.
+    pending_first_cached_reconfig: bool = False
 
     # ------------------------------------------------------------------
     # 4) Execute operations, routing between parallel MS rounds as needed
     # ------------------------------------------------------------------
     while operationsLeft:
+        logger.info(
+            "%s main loop: idx=%d, remaining_operations=%d, remaining_MS_rounds=%d",
+            PATCH_LOG_PREFIX,
+            idx,
+            len(operationsLeft),
+            max(0, len(toMoves) - idx),
+        )
+
         if len(toMoves) > idx:
             if (not hadMultipleTilingSteps) and tiling_steps and tiling_steps[0]:
-                pass # In this case, we just use the pre-calculated next round reconfiguration
+                # Reuse the pre-computed tiling plan from the previous iteration.
+                # The flag `tiling_steps_from_cache` remains whatever it was when
+                # this tiling plan was first constructed (fresh or cached).
+                pass
             else:
-                # 4a) Between MS rounds: re-route using next lookahead window of pairs
-                P_arr = parallelPairs[idx : min(len(parallelPairs), lookahead + idx)].copy()
-                tiling_steps = _patch_and_route(
-                    oldArrangementArr,
-                    wiseArch,
-                    P_arr,
-                    subgridsize,
-                    active_ions=active_ions,
-                    ignore_initial_reconfig=(idx==0),
-                    base_pmax_in=base_pmax_in,
+                # 4a) Between MS rounds: re-route using next lookahead window of pairs.
+                # The routing horizon is controlled by `lookahead`, but the caching
+                # of routing results (block_cache) is based on a fixed-size block
+                # defined purely over `parallelPairs`, independent of lookahead.
+                window_start = idx
+                window_end = min(len(parallelPairs), lookahead + idx)
+                logger.info(
+                    "%s computing routing window: idx=%d, rounds=[%d,%d), lookahead=%d, window_len=%d",
+                    PATCH_LOG_PREFIX,
+                    idx,
+                    window_start,
+                    window_end,
+                    lookahead,
+                    window_end - window_start,
                 )
-                hadMultipleTilingSteps = len(tiling_steps)>1
+                P_arr = parallelPairs[window_start:window_end].copy()
+
+                # Build a canonical, hashable key for a block of MS rounds using
+                # only `parallelPairs`, independent of the lookahead window size.
+                # We use a fixed block length (e.g. 4 rounds) so that repeated
+                # 4-round patterns like parallelPairs[0:4], [9:13], ... share
+                # the same cache entry even if lookahead != 4.
+                BLOCK_LEN = 4
+                blk_end = min(len(parallelPairs), window_start + BLOCK_LEN)
+                block_key_rounds = parallelPairs[window_start:blk_end]
+                block_key: Tuple[Tuple[Tuple[int, int], ...], ...] = tuple(
+                    tuple(sorted(round_pairs)) for round_pairs in block_key_rounds
+                )
+
+                # For a given block (block_key), we may call _patch_and_route multiple
+                # times with different starting rounds inside that block, especially
+                # when lookahead is small (e.g. lookahead == 1). We therefore cache
+                # tiling metadata *per offset* inside the block, so that for a
+                # repeated block pattern we can reuse the appropriate tiling plan
+                # for each round position within that block.
+                cache_for_block = block_cache.setdefault(block_key, {})
+
+                # Determine the offset of this P_arr within the block pattern.
+                # For lookahead == 1, P_arr contains a single round; we find the
+                # index in block_key_rounds where that round appears.
+                offset_in_block: Optional[int] = None
+                if P_arr:
+                    first_round = P_arr[0]
+                    for pos, round_pairs in enumerate(block_key_rounds):
+                        # block_key_rounds entries are tuples, P_arr rounds are lists;
+                        # compare as lists for consistency.
+                        if list(round_pairs) == first_round:
+                            offset_in_block = pos
+                            break
+
+                if offset_in_block is not None and offset_in_block in cache_for_block:
+                    # We have solved this block *at this offset* before; reuse it.
+                    tiling_steps_meta = deepcopy(cache_for_block[offset_in_block])
+                    tiling_steps_from_cache = True
+                    pending_first_cached_reconfig = True
+                    logger.info(
+                        "%s reusing cached routing block at idx=%d (rounds=[%d,%d)); block_offset=%d, cached_tilings=%d",
+                        PATCH_LOG_PREFIX,
+                        idx,
+                        window_start,
+                        window_end,
+                        offset_in_block,
+                        len(tiling_steps_meta),
+                    )
+                else:
+                    # New (block, offset) combination: call the expensive patch-based
+                    # router and cache its result under this offset so that repeated
+                    # instances of the same block pattern reuse it.
+                    tiling_steps_meta = _patch_and_route(
+                        oldArrangementArr,
+                        wiseArch,
+                        P_arr,
+                        subgridsize,
+                        active_ions=active_ions,
+                        ignore_initial_reconfig=False,
+                        base_pmax_in=base_pmax_in,
+                        BTs=BTs,
+                    )
+                    tiling_steps_from_cache = False
+                    pending_first_cached_reconfig = False
+                    if offset_in_block is not None:
+                        cache_for_block[offset_in_block] = deepcopy(tiling_steps_meta)
+                    logger.info(
+                        "%s patch routing window idx=%d produced %d tiling steps (meta entries); block_offset=%s",
+                        PATCH_LOG_PREFIX,
+                        idx,
+                        len(tiling_steps_meta),
+                        str(offset_in_block)
+                    )
+
+                # Strip metadata for execution ordering; keep only per-tiling round lists.
+                tiling_steps = [snapshot for (_cy, _ti, snapshot) in tiling_steps_meta]
+                hadMultipleTilingSteps = len(tiling_steps) > 1
+
+                # Build new BTs (pins) from this returned long-horizon plan for future windows.
+                if tiling_steps_meta:
+                    active_set = set(active_ions)
+                    R_local = len(P_arr)
+                    # For rounds r >= 1, map (cycle_idx, tiling_idx) -> (bt_map, solved_pairs_r)
+                    BTs = [dict() for _ in range(R_local - 1)]
+                    for cycle_idx_meta, tiling_idx_meta, tiling in tiling_steps_meta:
+                        for r, (layout_after_r, _sched_r, _solved_pairs_r) in enumerate(tiling[1:]):
+                            bt_map: Dict[int, Tuple[int, int]] = {}
+                            layout_arr = layout_after_r
+                            for rr in range(wiseArch.n):
+                                for cc in range(wiseArch.m * wiseArch.k):
+                                    ionidx = int(layout_arr[rr][cc])
+                                    if ionidx in active_set:
+                                        bt_map[ionidx] = (rr, cc)
+                            key = (cycle_idx_meta, tiling_idx_meta)
+                            BTs[r][key] = (bt_map, list(_solved_pairs_r))
+
+                    num_bt_rounds = len(BTs)
+                    num_bt_windows = sum(len(round_dict) for round_dict in BTs)
+                    total_bt_pins = sum(
+                        len(bt_map)
+                        for round_dict in BTs
+                        for (bt_map, _pairs_r) in round_dict.values()
+                    )
+                    total_bt_pairs = sum(
+                        len(_pairs_r)
+                        for round_dict in BTs
+                        for (_bt_map, _pairs_r) in round_dict.values()
+                    )
+                    logger.info(
+                        "%s built BTs for window idx=%d: rounds=%d, windows=%d, pins=%d, pinned_pairs=%d",
+                        PATCH_LOG_PREFIX,
+                        idx,
+                        num_bt_rounds,
+                        num_bt_windows,
+                        total_bt_pins,
+                        total_bt_pairs,
+                    )
+                else:
+                    BTs = None
             if not tiling_step:
                 tiling_step = [t.pop(0) for t in tiling_steps]
+                logger.info(
+                    "%s idx=%d: initialised tiling_step list with %d entries (from_cache=%s)",
+                    PATCH_LOG_PREFIX,
+                    idx,
+                    len(tiling_step),
+                    tiling_steps_from_cache,
+                )
             layout_after, schedule, solved_pairs = tiling_step.pop(0)
+            if tiling_steps_from_cache and pending_first_cached_reconfig:
+                sched_arg = None
+                pending_first_cached_reconfig = False
+                logger.info(
+                    "%s using cache idx=%d; block_offset=%s, cache=%s, layout_after=%s, layout_before=%s",
+                    PATCH_LOG_PREFIX,
+                    idx,
+                    str(offset_in_block),
+                    str(cache_for_block),
+                    layout_after,
+                    oldArrangementArr
+                )
+            else:
+                sched_arg = schedule
+            logger.info(
+                "%s idx=%d: applying reconfiguration step; schedule_passes=%d, solved_pairs=%d, remaining_tiling_steps=%d, using_cached_schedule=%s",
+                PATCH_LOG_PREFIX,
+                idx,
+                len(sched_arg) if (sched_arg is not None) else 0,
+                len(solved_pairs),
+                len(tiling_step),
+                tiling_steps_from_cache
+            )
             oldArrangementArr = _apply_layout_as_reconfiguration(
                 arch,
                 wiseArch,
@@ -908,13 +1274,23 @@ def ionRoutingWISEArch(
                 newArrangementArr,
                 layout_after,
                 allOps,
-                schedule,
+                sched_arg,
                 initial_placement=(idx == 0),
             )
             barriers.append(len(allOps))
-            reconfigTime += allOps[-1]._reconfigTime
+            last_reconfig_time = getattr(allOps[-1], "_reconfigTime", 0.0)
+            reconfigTime += last_reconfig_time
+            logger.info(
+                "%s idx=%d: reconfiguration applied; delta_reconfigTime=%.6f, total_reconfigTime=%.6f, total_ops=%d",
+                PATCH_LOG_PREFIX,
+                idx,
+                last_reconfig_time,
+                reconfigTime,
+                len(allOps),
+            )
 
         # 4b) Run as many single-qubit operations as possible without routing
+        single_qubit_executed = 0
         while True:
             toRemove: List[Operation] = []
             ionsInvolved: Set[Ion] = set()
@@ -929,15 +1305,28 @@ def ionRoutingWISEArch(
                 op.run()
                 allOps.append(op)
                 operationsLeft.remove(op)
+                single_qubit_executed += 1
 
             if len(toRemove) == 0:
                 break
+
+        if single_qubit_executed:
+            logger.info(
+                "%s idx=%d: executed %d single-qubit ops; remaining_operations=%d, total_ops=%d",
+                PATCH_LOG_PREFIX,
+                idx,
+                single_qubit_executed,
+                len(operationsLeft),
+                len(allOps),
+            )
 
         barriers.append(len(allOps))
 
         if not operationsLeft:
             break
 
+        ms_gates_executed = 0
+        starting_idx = idx
         while idx < len(toMoves):
             # 4c) Execute one parallel round of two-qubit MS gates
             for op in toMoves[idx]:
@@ -947,12 +1336,18 @@ def ionRoutingWISEArch(
                     op.run()
                     allOps.append(op)
                     operationsLeft.remove(op)
+                    ms_gates_executed += 1
             if not tiling_step:
                 break
             if not any(t[2] for t in tiling_step):
                 tiling_step = []
                 break
             layout_after, schedule, solved_pairs = tiling_step.pop(0)
+            if tiling_steps_from_cache and pending_first_cached_reconfig:
+                sched_arg = None
+                pending_first_cached_reconfig = False
+            else:
+                sched_arg = schedule
             oldArrangementArr = _apply_layout_as_reconfiguration(
                 arch,
                 wiseArch,
@@ -960,11 +1355,32 @@ def ionRoutingWISEArch(
                 newArrangementArr,
                 layout_after,
                 allOps,
-                schedule,
+                sched_arg,
                 initial_placement=False,
             )
             barriers.append(len(allOps))
-            reconfigTime += allOps[-1]._reconfigTime
+            last_reconfig_time = getattr(allOps[-1], "_reconfigTime", 0.0)
+            reconfigTime += last_reconfig_time
+            logger.info(
+                "%s idx=%d: reconfiguration applied after MS round; delta_reconfigTime=%.6f, total_reconfigTime=%.6f, total_ops=%d",
+                PATCH_LOG_PREFIX,
+                idx,
+                last_reconfig_time,
+                reconfigTime,
+                len(allOps),
+            )
+
+        if ms_gates_executed:
+            candidate_gates = len(toMoves[starting_idx]) if starting_idx < len(toMoves) else 0
+            logger.info(
+                "%s idx=%d: executed %d/%d two-qubit MS gates; remaining_operations=%d, total_ops=%d",
+                PATCH_LOG_PREFIX,
+                starting_idx,
+                ms_gates_executed,
+                candidate_gates,
+                len(operationsLeft),
+                len(allOps),
+            )
 
         barriers.append(len(allOps))
         idx+=1

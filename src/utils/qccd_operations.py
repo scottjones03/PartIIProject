@@ -32,10 +32,965 @@ import time
 import pickle 
 import os
 import tempfile
+import shutil
 import multiprocessing as mp
 from scipy import stats
 from pysat.solvers import Solver
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import logging
+
+
+WISE_LOGGER_NAME = "wise.qccd.sat"
+wise_logger = logging.getLogger(WISE_LOGGER_NAME)
+if not wise_logger.handlers:
+    wise_logger.addHandler(logging.NullHandler())
+wise_logger.propagate = False
+
+
+
+@dataclass
+class _WiseSatBuilderContext:
+    A_in: np.ndarray
+    BT: List[Dict[int, Tuple[int, int]]]
+    P_arr: List[List[Tuple[int, int]]]
+    full_P_arr: List[List[Tuple[int, int]]]
+    ions: List[int]
+    n: int
+    m: int
+    R: int
+    block_cells: List[List[Tuple[int, int]]]
+    block_fully_inside: List[bool]
+    block_widths: List[int]
+    num_blocks: int
+    wB_col: int
+    wB_row: int
+    debug_diag: bool
+
+
+def _wise_build_structural_cnf(
+    ctx: _WiseSatBuilderContext,
+    P_bound: int,
+    sum_bound_B: Optional[int] = None,
+    use_wcnf: bool = False,
+    add_boundary_soft: bool = False,
+    phase_label: str = "",
+    debug_skip_pair_constraints: bool = False,
+    debug_allow_phase_flips: bool = False,
+    optimize_round_start: int = 0,
+    debug_core: bool = False,
+    core_granularity: str = "coarse",
+    debug_skip_cardinality: bool = False,
+    debug_disable_pairs_rounds: Optional[Set[int]] = None,
+    boundary_adjacent: Optional[Dict[str, bool]] = None,
+    cross_boundary_prefs: Optional[List[Dict[int, Set[str]]]] = None,
+    boundary_capacity_factor: float = 1.0,
+    *,
+    bt_soft_weight: int = 0,
+):
+    A_in = ctx.A_in
+    BT = ctx.BT
+    DEBUG_DIAG = ctx.debug_diag
+    P_arr = ctx.P_arr
+    R = ctx.R
+    block_cells = ctx.block_cells
+    block_fully_inside = ctx.block_fully_inside
+    block_widths = ctx.block_widths
+    full_P_arr = ctx.full_P_arr
+    ions = ctx.ions
+    m = ctx.m
+    n = ctx.n
+    num_blocks = ctx.num_blocks
+    wB_col = ctx.wB_col
+    wB_row = ctx.wB_row
+
+    vpool = IDPool()
+
+    # ------------- variable helpers -------------
+
+    def var_a(r, p, krow, jcol, ion):
+        return vpool.id(("a", r, p, krow, jcol, ion))
+
+    def var_s_h(r, p, krow, jcol):
+        return vpool.id(("s_h", r, p, krow, jcol))
+
+    def var_s_v(r, p, krow, jcol):
+        return vpool.id(("s_v", r, p, krow, jcol))
+
+    def var_phase(r, p):
+        return vpool.id(("phase", r, p))
+
+    def var_row_end(r, ion, d):
+        return vpool.id(("row_end", r, ion, d))
+
+    def var_w_end(r, ion, b):
+        return vpool.id(("w_end", r, ion, b))
+
+    def var_u(r, p):
+        return vpool.id(("u", r, p))
+
+    def is_reserved(r, ion):
+        return ion in BT[r]
+
+    def ion_in_full_P_arr(r, ion):
+        return any((ion in g) for g in full_P_arr[r])
+
+    def ion_in_minor_P_arr(r, ion):
+        return any((ion in g) for g in P_arr[r]) or is_reserved(r, ion)
+
+    # ------------- choose CNF or WCNF -------------
+
+    if use_wcnf:
+        formula = WCNF()
+    else:
+        formula = CNF()
+
+    grp = CoreGroups(
+        vpool=vpool,
+        enabled=(debug_core and not use_wcnf),
+        granularity=core_granularity,
+    )
+
+    def add_hard(
+        cl: List[int],
+        group_name: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if use_wcnf:
+            formula.append(cl)
+        else:
+            grp.add(formula, cl, group_name, meta=meta)
+
+    def add_soft(cl: List[int], weight: int = 1) -> None:
+        if use_wcnf:
+            formula.append(cl, weight=weight)
+        else:
+            raise RuntimeError("Soft clauses not allowed in pure CNF mode")
+
+    if debug_disable_pairs_rounds is None:
+        disable_pairs_rounds: Set[int] = set()
+    else:
+        disable_pairs_rounds = set(debug_disable_pairs_rounds)
+
+    P_bounds = ([P_bound + n + m] * optimize_round_start + [P_bound] * (R - optimize_round_start))
+
+    if boundary_adjacent is None:
+        boundary_adjacent = {
+            "top": True,
+            "bottom": True,
+            "left": True,
+            "right": True,
+        }
+    else:
+        boundary_adjacent = {
+            "top": bool(boundary_adjacent.get("top", False)),
+            "bottom": bool(boundary_adjacent.get("bottom", False)),
+            "left": bool(boundary_adjacent.get("left", False)),
+            "right": bool(boundary_adjacent.get("right", False)),
+        }
+
+    if cross_boundary_prefs is None:
+        cross_boundary_prefs_norm: List[Dict[int, Set[str]]] = [dict() for _ in range(R)]
+    else:
+        cross_boundary_prefs_norm = []
+        for r in range(R):
+            prefs_r = cross_boundary_prefs[r] if r < len(cross_boundary_prefs) else {}
+            normalized: Dict[int, Set[str]] = {}
+            for ion, dirs in prefs_r.items():
+                normalized[ion] = set(dirs)
+            cross_boundary_prefs_norm.append(normalized)
+
+    half_h = max(1, n // 2)
+    half_w = max(1, m // 2)
+
+    def cells_for_direction(direction: str) -> List[Tuple[int, int]]:
+        cells: List[Tuple[int, int]] = []
+        if direction == "left":
+            if not boundary_adjacent["left"]:
+                return cells
+            for d in range(n):
+                for c in range(half_w):
+                    cells.append((d, c))
+        elif direction == "right":
+            if not boundary_adjacent["right"]:
+                return cells
+            start = max(0, m - half_w)
+            for d in range(n):
+                for c in range(start, m):
+                    cells.append((d, c))
+        elif direction == "top":
+            if not boundary_adjacent["top"]:
+                return cells
+            for d in range(half_h):
+                for c in range(m):
+                    cells.append((d, c))
+        elif direction == "bottom":
+            if not boundary_adjacent["bottom"]:
+                return cells
+            start = max(0, n - half_h)
+            for d in range(start, n):
+                for c in range(m):
+                    cells.append((d, c))
+        return cells
+
+    # ------------------------------------------------------------------
+    # (0) Global permutation: exactly one ion per cell AND each ion in exactly one cell
+    # ------------------------------------------------------------------
+    if not debug_skip_cardinality:
+        # (0a) Exactly one ion per cell (r,p,k,j)
+        for r in range(R):
+            g_cell = f"CARD_CELL:r{r}"
+            for p in range(P_bounds[r] + 1):
+                for krow in range(n):
+                    for jcol in range(m):
+                        lits = [var_a(r, p, krow, jcol, ion) for ion in ions]
+                        enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+                        for cl in enc.clauses:
+                            add_hard(cl, g_cell)
+
+        g_cell_final = "CARD_CELL:FINAL"
+        for krow in range(n):
+            for jcol in range(m):
+                lits = [var_a(R, 0, krow, jcol, ion) for ion in ions]
+                enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+                for cl in enc.clauses:
+                    add_hard(cl, g_cell_final)
+
+        # (0b) Each ion occupies exactly one cell (k,j) at every (r,p)
+        for r in range(R):
+            g_ion_r = f"CARD_ION:r{r}"
+            for p in range(P_bounds[r] + 1):
+                for ion in ions:
+                    lits = [var_a(r, p, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
+                    enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+                    for cl in enc.clauses:
+                        add_hard(cl, g_ion_r)
+
+        g_ion_final = "CARD_ION:FINAL"
+        for ion in ions:
+            lits = [var_a(R, 0, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
+            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
+            for cl in enc.clauses:
+                add_hard(cl, g_ion_final)
+
+    # ------------------------------------------------------------------
+    # (1) Initial layout and inter-round chaining
+    # ------------------------------------------------------------------
+
+    # (1a) Initial layout: a[0,0] equals A_in
+    for krow in range(n):
+        for jcol in range(m):
+            ion0 = int(A_in[krow, jcol])
+            # Ion ion0 must be there
+            add_hard([var_a(0, 0, krow, jcol, ion0)], "INIT")
+            # No other ion may be there at (0,0)
+            for ion in ions:
+                if ion != ion0:
+                    add_hard([-var_a(0, 0, krow, jcol, ion)], "INIT")
+
+    # (1b) Chaining: a[r+1,0] <-> a[r,P_bounds[r]] for r=0..R-1
+    for r in range(R):
+        g_chain_r = f"CHAIN:r{r}"
+        for krow in range(n):
+            for jcol in range(m):
+                for ion in ions:
+                    a_next = var_a(r + 1, 0, krow, jcol, ion)
+                    a_end  = var_a(r, P_bounds[r], krow, jcol, ion)
+                    add_hard([-a_next, a_end], g_chain_r)
+                    add_hard([-a_end, a_next], g_chain_r)
+
+    # ------------------------------------------------------------------
+    # (2) BT pinning at end-of-round (FINAL STATE ONLY)
+    # ------------------------------------------------------------------
+
+    use_soft_bt = use_wcnf and bt_soft_weight > 0
+
+    for r in range(R):
+        P_final = P_bounds[r]
+        for ion in ions:
+            if not is_reserved(r, ion):
+                continue
+            d_fix, c_fix = BT[r][ion]
+            pin_lit = var_a(r, P_final, d_fix, c_fix, ion)
+
+            if use_soft_bt:
+                # Encourage pinned location but allow solver to deviate if needed.
+                add_soft([pin_lit], weight=bt_soft_weight)
+                continue
+
+            # HARD BT (existing behaviour)
+            add_hard([pin_lit], "BT")
+            for krow in range(n):
+                for jcol in range(m):
+                    if (krow, jcol) != (d_fix, c_fix):
+                        add_hard([-var_a(r, P_final, krow, jcol, ion)], "BT")
+
+    # ------------------------------------------------------------------
+    # (3) Phase structure: horizontal -> vertical
+    # ------------------------------------------------------------------
+
+    # (3a) Monotonicity: phase[r,p] -> phase[r,p+1] for each round r
+    if not debug_allow_phase_flips:
+        for r in range(R):
+            if P_bounds[r] > 1:
+                for p in range(P_bounds[r] - 1):
+                    add_hard([-var_phase(r, p), var_phase(r, p + 1)], "PHASE_MONO")
+
+    # ------------------------------------------------------------------
+    # (4) Horizontal and (5) Vertical comparators + semantics + copy constraints
+    # ------------------------------------------------------------------
+
+    for r in range(R):
+        for p in range(P_bounds[r]):
+            phase_p = var_phase(r,p)
+
+            # ---------------- Horizontal comparators (row-wise) ----------------
+            for krow in range(n):
+                for jcol in range(m - 1):
+                    sh = var_s_h(r, p, krow, jcol)
+
+                    # Gating: if phase[p] = 1 (vertical), horizontal comparators must be off
+                    # phase[p] = 1 ⇒ ¬s_h  ==  (¬phase[p] ∨ ¬s_h)
+                    add_hard([-phase_p, -sh], "H_GATE")
+
+                    # Parity (odd-even) for horizontal comparisons:
+                    # here we just use p%2 as horizontal parity:
+                    #   if jcol % 2 != p % 2 then s_h must be 0
+                    if jcol % 2 != (p % 2):
+                        add_hard([-sh], "H_GATE")
+
+                    # Forward-only SWAP semantics between (krow,jcol) and (krow,jcol+1)
+                    # NOTE: we ONLY constrain the s=1 (swap) case here.
+                    #       The s=0 (identity) case is handled by the horizontal copy
+                    #       constraints below, which are guarded on ¬phase and ¬s_left/¬s_right.
+                    for ion in ions:
+                        a_cur_j = var_a(r, p, krow, jcol, ion)
+                        a_cur_j1 = var_a(r, p, krow, jcol + 1, ion)
+                        a_next_j = var_a(r, p + 1, krow, jcol, ion)
+                        a_next_j1 = var_a(r, p + 1, krow, jcol + 1, ion)
+
+                        # (H3) If s=1 and ion is in right cell at p, it must be in left at p+1:
+                        #      (s ∧ a_cur_j1) -> a_next_j
+                        add_hard([-sh, -a_cur_j1, a_next_j], "H_SEM")
+
+                        # (H4) If s=1 and ion is in left cell at p, it must be in right at p+1:
+                        #      (s ∧ a_cur_j) -> a_next_j1
+                        add_hard([-sh, -a_cur_j, a_next_j1], "H_SEM")
+
+            # ---------------- Vertical comparators (column-wise) ----------------
+            for krow in range(n - 1):
+                for jcol in range(m):
+                    sv = var_s_v(r, p, krow, jcol)
+
+                    # Gating: if phase[p] = 0 (horizontal), vertical comparators must be off
+                    # phase[p] = 0 ⇒ ¬s_v  ==  (phase[p] ∨ ¬s_v)
+                    add_hard([phase_p, -sv], "V_GATE")
+
+                    # Parity (odd-even) for vertical comparisons, using p%2 as v-index:
+                    #   if krow % 2 != p % 2 then s_v must be 0
+                    if krow % 2 != (p % 2):
+                        add_hard([-sv], "V_GATE")
+
+                    # Forward-only SWAP semantics between (krow,jcol) and (krow+1,jcol)
+                    # Again, ONLY the s=1 case is constrained here; s=0 is enforced by
+                    # the vertical copy constraints (phase ∧ ¬s_up ∧ ¬s_down).
+                    for ion in ions:
+                        a_cur_top = var_a(r, p, krow, jcol, ion)
+                        a_cur_bot = var_a(r, p, krow + 1, jcol, ion)
+                        a_next_top = var_a(r, p + 1, krow, jcol, ion)
+                        a_next_bot = var_a(r, p + 1, krow + 1, jcol, ion)
+
+                        # (V3) If s=1 and ion is in bottom cell at p, it must be in top at p+1:
+                        #      (s ∧ a_cur_bot) -> a_next_top
+                        add_hard([-sv, -a_cur_bot, a_next_top], "V_SEM")
+
+                        # (V4) If s=1 and ion is in top cell at p, it must be in bottom at p+1:
+                        #      (s ∧ a_cur_top) -> a_next_bot
+                        add_hard([-sv, -a_cur_top, a_next_bot], "V_SEM")
+
+    # -------- Copy constraints for non-participating cells (horizontal phase) --------
+    for r in range(R):
+        for p in range(P_bounds[r]):
+            phase_p = var_phase(r,p)
+            for krow in range(n):
+                for jcol in range(m):
+                    # horizontal comparators that touch (krow,jcol)
+                    s_left = var_s_h(r, p, krow, jcol - 1) if jcol > 0 else None
+                    s_right = var_s_h(r, p, krow, jcol) if jcol < m - 1 else None
+
+                    # antecedent: (¬phase[p] ∧ ¬s_left ∧ ¬s_right)
+                    lits_ante_neg = [phase_p]  # this is ¬(¬phase), used on the clause side
+
+                    if s_left is not None:
+                        lits_ante_neg.append(s_left)
+                    if s_right is not None:
+                        lits_ante_neg.append(s_right)
+
+                    for ion in ions:
+                        a_cur = var_a(r, p, krow, jcol, ion)
+                        a_next = var_a(r, p + 1, krow, jcol, ion)
+
+                        # (¬phase ∧ ¬s_left ∧ ¬s_right ∧ a_cur) -> a_next
+                        # CNF: (phase ∨ s_left ∨ s_right ∨ ¬a_cur ∨ a_next)
+                        add_hard(lits_ante_neg + [-a_cur, a_next], "H_COPY")
+
+                        # (¬phase ∧ ¬s_left ∧ ¬s_right ∧ a_next) -> a_cur
+                        # CNF: (phase ∨ s_left ∨ s_right ∨ ¬a_next ∨ a_cur)
+                        add_hard(lits_ante_neg + [-a_next, a_cur], "H_COPY")
+
+    # -------- Copy constraints for non-participating cells (vertical phase) --------
+    for r in range(R):
+        for p in range(P_bounds[r]):
+            phase_p = var_phase(r,p)
+            for krow in range(n):
+                for jcol in range(m):
+                    # vertical comparators that touch (krow,jcol)
+                    s_up = var_s_v(r, p, krow - 1, jcol) if krow > 0 else None
+                    s_down = var_s_v(r, p, krow, jcol) if krow < n - 1 else None
+
+                    # antecedent: (phase[p] ∧ ¬s_up ∧ ¬s_down)
+                    lits_ante_neg = [-phase_p]  # this is ¬phase on the clause side
+
+                    if s_up is not None:
+                        lits_ante_neg.append(s_up)
+                    if s_down is not None:
+                        lits_ante_neg.append(s_down)
+
+                    for ion in ions:
+                        a_cur = var_a(r, p, krow, jcol, ion)
+                        a_next = var_a(r, p + 1, krow, jcol, ion)
+
+                        # (phase ∧ ¬s_up ∧ ¬s_down ∧ a_cur) -> a_next
+                        # CNF: (¬phase ∨ s_up ∨ s_down ∨ ¬a_cur ∨ a_next)
+                        add_hard(lits_ante_neg + [-a_cur, a_next], "V_COPY")
+
+                        # (phase ∧ ¬s_up ∧ ¬s_down ∧ a_next) -> a_cur
+                        # CNF: (¬phase ∨ s_up ∨ s_down ∨ ¬a_next ∨ a_cur)
+                        add_hard(lits_ante_neg + [-a_next, a_cur], "V_COPY")
+
+    # ------------------------------------------------------------------
+    # (5) End-of-round row/block abstraction and pair constraints
+    # ------------------------------------------------------------------
+
+    for r in range(R):
+        g_rb_r = f"ROWBLOCK_LINK:r{r}"
+        g_pair_r = f"PAIR_REQ:r{r}"
+
+        # row_end / w_end linkage from final layout a[r,P_bounds[r]]
+        for ion in ions:
+            # row_end
+            for d in range(n):
+                re = var_row_end(r, ion, d)
+                cell_lits = [var_a(r, P_bounds[r], d, j, ion) for j in range(m)]
+                add_hard([-re] + cell_lits, g_rb_r)
+                for aj in cell_lits:
+                    add_hard([-aj, re], g_rb_r)
+
+            # w_end (global block alignment)
+            for b_local in range(num_blocks):
+                we = var_w_end(r, ion, b_local)
+                cell_list = block_cells[b_local]
+                cells = [var_a(r, P_bounds[r], d, j_local, ion) for (d, j_local) in cell_list]
+                if block_fully_inside[b_local] or (block_widths[b_local]>1):
+                    add_hard([-we] + cells, g_rb_r)
+                    for aj in cells:
+                        add_hard([-aj, we], g_rb_r)
+                else:
+                    add_hard([-we], g_rb_r)
+
+        # Pairs must share same row and block (unless skipping for debug)
+        if not debug_skip_pair_constraints:
+            if r in disable_pairs_rounds:
+                pass
+            else:
+                for (i1, i2) in P_arr[r]:
+                    if i1 not in ions or i2 not in ions:
+                        continue
+
+                    # Same row
+                    for d in range(n):
+                        re1 = var_row_end(r, i1, d)
+                        re2 = var_row_end(r, i2, d)
+                        add_hard([-re1, re2], g_pair_r)
+                        add_hard([-re2, re1], g_pair_r)
+                    # Same block (global aligned); only enforce for fully covered blocks
+                    for b_local in range(num_blocks):
+                        we1 = var_w_end(r, i1, b_local)
+                        we2 = var_w_end(r, i2, b_local)
+                        add_hard([-we1, we2], g_pair_r)
+                        add_hard([-we2, we1], g_pair_r)
+
+    # ------------------------------------------------------------------
+    # (6) Optional Level-3 soft clauses (boundary avoidance, swap-cost)
+    # ------------------------------------------------------------------
+    if use_wcnf and add_boundary_soft and (wB_row > 0 or wB_col > 0):
+        inner_ions_per_round: List[Set[int]] = []
+        for r in range(R):
+            inner_ions = set()
+            for (i1, i2) in P_arr[r]:
+                inner_ions.add(i1)
+                inner_ions.add(i2)
+            inner_ions.update(BT[r].keys())
+            inner_ions_per_round.append(inner_ions)
+
+        for r in range(R):
+            inner_ions = inner_ions_per_round[r]
+            cross_prefs_r = cross_boundary_prefs[r] if r < len(cross_boundary_prefs) else {}
+            for ion in ions:
+                dirs = cross_prefs_r.get(ion)
+                if dirs:
+                    for direction in dirs:
+                        if direction in ("left", "right") and wB_col > 0:
+                            if not boundary_adjacent.get(direction, False):
+                                continue
+                            target_col = 0 if direction == "left" else m - 1
+                            lits = [var_a(r, P_bounds[r], d, target_col, ion) for d in range(n)]
+                            if lits:
+                                add_soft(lits, weight=wB_col)
+                        if direction in ("top", "bottom") and wB_row > 0:
+                            if not boundary_adjacent.get(direction, False):
+                                continue
+                            target_row = 0 if direction == "top" else n - 1
+                            lits = [var_a(r, P_bounds[r], target_row, jcol, ion) for jcol in range(m)]
+                            if lits:
+                                add_soft(lits, weight=wB_row)
+
+                if ion in inner_ions:
+                    if boundary_adjacent.get("left", False) and wB_col > 0:
+                        for d in range(n):
+                            add_soft([-var_a(r, P_bounds[r], d, 0, ion)], weight=wB_col)
+                    if boundary_adjacent.get("right", False) and wB_col > 0:
+                        for d in range(n):
+                            add_soft([-var_a(r, P_bounds[r], d, m - 1, ion)], weight=wB_col)
+                    if boundary_adjacent.get("top", False) and wB_row > 0:
+                        for jcol in range(m):
+                            add_soft([-var_a(r, P_bounds[r], 0, jcol, ion)], weight=wB_row)
+                    if boundary_adjacent.get("bottom", False) and wB_row > 0:
+                        for jcol in range(m):
+                            add_soft([-var_a(r, P_bounds[r], n - 1, jcol, ion)], weight=wB_row)
+
+    if cross_boundary_prefs_norm and any(boundary_adjacent.values()):
+        factor = max(0.0, min(1.0, boundary_capacity_factor))
+        dir_capacity: Dict[str, int] = {}
+        if boundary_adjacent.get("top", False):
+            dir_capacity["top"] = int(round(half_h * m * factor))
+        if boundary_adjacent.get("bottom", False):
+            dir_capacity["bottom"] = int(round(half_h * m * factor))
+        if boundary_adjacent.get("left", False):
+            dir_capacity["left"] = int(round(half_w * n * factor))
+        if boundary_adjacent.get("right", False):
+            dir_capacity["right"] = int(round(half_w * n * factor))
+
+        ions_per_round_dir: Dict[Tuple[int, str], List[int]] = defaultdict(list)
+        for r, prefs_r in enumerate(cross_boundary_prefs_norm):
+            for ion, dirs in prefs_r.items():
+                for direction in dirs:
+                    if direction in dir_capacity:
+                        ions_per_round_dir[(r, direction)].append(ion)
+
+        for key in ions_per_round_dir:
+            ions_per_round_dir[key].sort()
+
+        enforced_dirs_per_ion: Dict[Tuple[int, int], Set[str]] = defaultdict(set)
+        for (r, direction), ion_list in ions_per_round_dir.items():
+            cap = dir_capacity.get(direction, 0)
+            if cap <= 0:
+                continue
+            for ion in ion_list[:cap]:
+                enforced_dirs_per_ion[(r, ion)].add(direction)
+
+        def _band_cells_for_dirs(directions: Set[str]) -> List[Tuple[int, int]]:
+            row_min, row_max = 0, n - 1
+            col_min, col_max = 0, m - 1
+            if "top" in directions:
+                row_max = min(row_max, half_h - 1)
+            if "bottom" in directions:
+                row_min = max(row_min, n - half_h)
+            if "left" in directions:
+                col_max = min(col_max, half_w - 1)
+            if "right" in directions:
+                col_min = max(col_min, m - half_w)
+            if row_min > row_max or col_min > col_max:
+                return []
+            return [
+                (rr, cc)
+                for rr in range(row_min, row_max + 1)
+                for cc in range(col_min, col_max + 1)
+            ]
+
+        for r in range(R):
+            prefs_r = cross_boundary_prefs_norm[r]
+            if not prefs_r:
+                continue
+            P_final = P_bounds[r]
+            for ion in prefs_r.keys():
+                enforced_dirs = enforced_dirs_per_ion.get((r, ion))
+                if not enforced_dirs:
+                    continue
+                cells = _band_cells_for_dirs(enforced_dirs)
+                if not cells:
+                    union_cells: Set[Tuple[int, int]] = set()
+                    for direction in enforced_dirs:
+                        union_cells.update(_band_cells_for_dirs({direction}))
+                    cells = list(union_cells)
+                if not cells:
+                    if DEBUG_DIAG:
+                        wise_logger.debug(
+                            "[CROSS_BOUNDARY] no valid cells for ion %d round %d dirs=%s; skipping",
+                            ion,
+                            r,
+                            sorted(enforced_dirs),
+                        )
+                    continue
+                clause = [var_a(r, P_final, d, c, ion) for (d, c) in cells]
+                add_hard(clause, "CROSS_BOUNDARY")
+
+    # -------------------------------
+    # Per-round pass usage helpers (u) and global Σ_r P_r bound
+    # -------------------------------
+    # Keep u[r,p] as-is: u <-> (OR of comparators)
+    for r in range(R):
+        for p in range(P_bounds[r]):
+            u_rp = var_u(r, p)
+
+            comp_lits: List[int] = []
+            for krow in range(n):
+                for jcol in range(m - 1):
+                    comp_lits.append(var_s_h(r, p, krow, jcol))
+            for krow in range(n - 1):
+                for jcol in range(m):
+                    comp_lits.append(var_s_v(r, p, krow, jcol))
+
+            if not comp_lits:
+                # No comparators exist at all in this pass: u must be false.
+                add_hard([-u_rp], "UTIL_U")
+                continue
+
+            # u[r,p] ↔ OR(comp_lits)
+            add_hard([-u_rp] + comp_lits, "UTIL_U")
+            for s_lit in comp_lits:
+                add_hard([-s_lit, u_rp], "UTIL_U")
+
+    if sum_bound_B is not None and optimize_round_start < R:
+        sum_u_lits: List[int] = []
+        for r in range(optimize_round_start, R):
+            for p in range(P_bounds[r]):
+                sum_u_lits.append(var_u(r, p))
+
+        total_slots = len(sum_u_lits)
+        bound = min(sum_bound_B, total_slots)
+        if bound < total_slots:
+            card_enc = CardEnc.atmost(
+                lits=sum_u_lits,
+                bound=bound,
+                encoding=EncType.totalizer,
+                vpool=vpool,
+            )
+            for clause in card_enc.clauses:
+                add_hard(clause, "SUM_BOUND")
+
+    selectors = grp.sel if grp.enabled else {}
+    group_meta = grp.meta if grp.enabled else {}
+    return formula, vpool, ions, var_a, selectors, group_meta
+
+
+
+
+def _wise_decode_schedule_from_model(
+    model: List[int],
+    vpool,
+    n: int,
+    m: int,
+    R: int,
+    P_bound: int,
+    ignore_initial_reconfig: bool,
+) -> List[List[Dict[str, Any]]]:
+    model_set = {lit for lit in model if lit > 0}
+    P_bounds = ([P_bound+n+m]*int(ignore_initial_reconfig) + [P_bound]*(R-int(ignore_initial_reconfig)))
+
+    def lit_true(v: int) -> bool:
+        return v in model_set
+
+    def var_s_h(r, p, krow, jcol):
+        return vpool.id(("s_h", r, p, krow, jcol))
+
+    def var_s_v(r, p, krow, jcol):
+        return vpool.id(("s_v", r, p, krow, jcol))
+
+    def var_phase(r, p):
+        return vpool.id(("phase", r, p))
+
+    schedule: List[List[Dict[str, Any]]] = [[] for _ in range(R)]
+    for r in range(R):
+        for p in range(P_bounds[r]):
+            phase_lit = var_phase(r, p)
+            is_vertical = (phase_lit <= vpool.top and lit_true(phase_lit))
+            phase = "V" if is_vertical else "H"
+
+            pass_info: Dict[str, Any] = {
+                "phase": phase,
+                "h_swaps": [],
+                "v_swaps": [],
+            }
+
+            if phase == "H":
+                # Horizontal comparators at this pass
+                for krow in range(n):
+                    for jcol in range(m - 1):
+                        v = var_s_h(r, p, krow, jcol)
+                        if v <= vpool.top and lit_true(v):
+                            pass_info["h_swaps"].append((krow, jcol))
+            else:
+                # Vertical comparators at this pass
+                for krow in range(n - 1):
+                    for jcol in range(m):
+                        v = var_s_v(r, p, krow, jcol)
+                        if v <= vpool.top and lit_true(v):
+                            pass_info["v_swaps"].append((krow, jcol))
+
+            schedule[r].append(pass_info)
+
+    return schedule
+
+
+
+def _wise_extract_round_pass_usage(model, vpool, R, P_bound, ignore_initial_reconfig: bool, n: int, m: int):
+    model_set = {lit for lit in model if lit > 0}
+    P_bounds = ([P_bound+n+m]*int(ignore_initial_reconfig) + [P_bound]*(R-int(ignore_initial_reconfig)))
+
+    def lit_true(v: int) -> bool:
+        return v in model_set
+
+    def var_u(r, p):
+        return vpool.id(("u", r, p))
+
+    per_round: List[int] = []
+    for r in range(R):
+        count = 0
+        for p in range(P_bounds[r]):
+            u_lit = var_u(r, p)
+            if u_lit <= vpool.top and lit_true(u_lit):
+                count += 1
+        per_round.append(count)
+
+    return per_round
+
+
+
+def _wise_sat_config_worker(
+    cfg: Tuple[int, float],
+    *,
+    context: _WiseSatBuilderContext,
+    optimize_round_start: int,
+    max_sat_time: float,
+    max_rc2_time: float,
+    boundary_adjacent: Dict[str, bool],
+    cross_boundary_prefs: List[Dict[int, Set[str]]],
+    ignore_initial_reconfig: bool,
+    progress_path: Optional[str] = None,
+    bt_soft_weight: int = 0,
+) -> Dict[str, Any]:
+    """
+    For a given (P_max, boundary_capacity_factor) configuration, perform a binary search
+    over Σ_r P_r bounds to find the tightest satisfiable schedule.
+    """
+    P_max, boundary_capacity_factor = cfg
+    rounds_under_sum = max(1, context.R - optimize_round_start)
+    max_bound_B = rounds_under_sum * P_max
+    low = 1
+    high = max_bound_B
+    best_result: Optional[Dict[str, Any]] = None
+    last_result: Optional[Dict[str, Any]] = None
+    use_soft_bt = bt_soft_weight > 0
+
+    wise_logger.debug(
+        "[WISE] config start: P_max=%d, cap_factor=%.2f, ΣP bound in [1,%d]",
+        P_max,
+        boundary_capacity_factor,
+        max_bound_B,
+    )
+
+    def publish(res: Dict[str, Any]) -> None:
+        if not progress_path:
+            return
+        try:
+            tmp_path = f"{progress_path}.tmp"
+            with open(tmp_path, "wb") as f:
+                pickle.dump(res, f)
+            os.replace(tmp_path, progress_path)
+        except Exception:
+            pass
+
+    def _solve_with_bound(sum_bound_B: int) -> Dict[str, Any]:
+        try:
+            (
+                formula_mid,
+                vpool_mid,
+                _,
+                _,
+                grp_sel_mid,
+                _,
+            ) = _wise_build_structural_cnf(
+                context,
+                P_max,
+                sum_bound_B=sum_bound_B,
+                use_wcnf=use_soft_bt,
+                add_boundary_soft=use_soft_bt,
+                phase_label=f"ΣP<={sum_bound_B}",
+                optimize_round_start=optimize_round_start,
+                debug_core=False,
+                core_granularity="coarse",
+                debug_skip_cardinality=False,
+                boundary_adjacent=boundary_adjacent,
+                cross_boundary_prefs=cross_boundary_prefs,
+                boundary_capacity_factor=boundary_capacity_factor,
+                bt_soft_weight=bt_soft_weight,
+            )
+
+            cost_mid: Optional[int] = None
+            if use_soft_bt:
+                model_mid, cost_mid, status_solver = run_rc2_with_timeout_file(
+                    formula_mid,
+                    timeout_s=max_rc2_time,
+                    debug_prefix="[WISE-RC2]",
+                )
+                sat_ok = status_solver == "ok" and model_mid is not None
+            else:
+                assumptions_mid = (
+                    [-lit for lit in grp_sel_mid.values()] if grp_sel_mid else None
+                )
+
+                sat_ok, model_mid, status_solver = run_sat_with_timeout_file(
+                    formula_mid,
+                    timeout_s=max_sat_time,
+                    debug_prefix=None,
+                    assumptions=assumptions_mid,
+                )
+        except Exception as e:
+            return {
+                "P_max": P_max,
+                "boundary_capacity_factor": boundary_capacity_factor,
+                "status": f"error:{repr(e)}",
+                "sat": False,
+                "schedule": None,
+                "per_round_usage": None,
+                "model": None,
+            }
+
+        if status_solver != "ok" or not sat_ok or model_mid is None:
+            return {
+                "P_max": P_max,
+                "boundary_capacity_factor": boundary_capacity_factor,
+                "status": status_solver if status_solver != "ok" else "unsat",
+                "sat": bool(sat_ok),
+                "schedule": None,
+                "per_round_usage": None,
+                "model": None,
+                "cost": cost_mid,
+            }
+
+        schedule = _wise_decode_schedule_from_model(
+            model_mid,
+            vpool_mid,
+            context.n,
+            context.m,
+            context.R,
+            P_max,
+            ignore_initial_reconfig,
+        )
+        per_round = _wise_extract_round_pass_usage(
+            model_mid,
+            vpool_mid,
+            context.R,
+            P_max,
+            ignore_initial_reconfig,
+            context.n,
+            context.m,
+        )
+
+        return {
+            "P_max": P_max,
+            "boundary_capacity_factor": boundary_capacity_factor,
+            "status": "ok",
+            "sat": True,
+            "schedule": schedule,
+            "per_round_usage": per_round,
+            "model": model_mid,
+            "cost": cost_mid,
+        }
+
+    while low <= high:
+        mid = (low + high) // 2
+        wise_logger.debug(
+            "[WISE] config P_max=%d cap=%.2f: trying ΣP<=%d",
+            P_max,
+            boundary_capacity_factor,
+            mid,
+        )
+        result = _solve_with_bound(mid)
+        last_result = result
+
+        if result.get("status") == "ok" and result.get("sat") and result.get("model") is not None:
+            sum_usage_mid = int(sum((result.get("per_round_usage") or [])))
+            wise_logger.debug(
+                "[WISE] config P_max=%d cap=%.2f: SAT at ΣP=%d (usage=%d)",
+                P_max,
+                boundary_capacity_factor,
+                mid,
+                sum_usage_mid,
+            )
+            result["sum_bound_B"] = mid
+            best_result = result
+            publish(result)
+            high = mid - 1
+        else:
+            wise_logger.debug(
+                "[WISE] config P_max=%d cap=%.2f: status=%s at ΣP=%d",
+                P_max,
+                boundary_capacity_factor,
+                result.get("status"),
+                mid,
+            )
+            low = mid + 1
+
+    if best_result is not None:
+        wise_logger.info(
+            "[WISE] config done: P_max=%d cap=%.2f best ΣP=%d",
+            P_max,
+            boundary_capacity_factor,
+            best_result.get("sum_bound_B"),
+        )
+        return best_result
+
+    if last_result is not None:
+        wise_logger.info(
+            "[WISE] config partial: P_max=%d cap=%.2f returning last status=%s",
+            P_max,
+            boundary_capacity_factor,
+            last_result.get("status"),
+        )
+        publish(last_result)
+        return last_result
+
+    res_default = {
+        "P_max": P_max,
+        "boundary_capacity_factor": boundary_capacity_factor,
+        "status": "unsat",
+        "sat": False,
+        "schedule": None,
+        "per_round_usage": None,
+        "model": None,
+    }
+    publish(res_default)
+    wise_logger.info(
+        "[WISE] config fail: P_max=%d cap=%.2f no SAT solution found",
+        P_max,
+        boundary_capacity_factor,
+    )
+    return res_default
+
+
+
 
 # ---------- UNSAT core helpers ----------
 
@@ -142,9 +1097,9 @@ def run_sat_with_timeout_file(
 
     if timeout_s is not None and timeout_s <= 0:
         if debug_prefix:
-            print(
-                f"{debug_prefix} SAT disabled (timeout <= 0); treating as timeout.",
-                flush=True,
+            wise_logger.debug(
+                "%s SAT disabled (timeout <= 0); treating as timeout.",
+                debug_prefix,
             )
         return None, None, "timeout"
 
@@ -162,20 +1117,20 @@ def run_sat_with_timeout_file(
         p.daemon = True
 
         if debug_prefix:
-            print(
-                f"{debug_prefix} SAT worker starting (timeout={timeout_s:.1f}s) "
-                f"for CNF: clauses={len(cnf.clauses)}",
-                flush=True,
+            wise_logger.debug(
+                "%s SAT worker starting (timeout=%.1fs) for CNF: clauses=%d",
+                debug_prefix,
+                timeout_s,
+                len(cnf.clauses),
             )
 
         try:
             p.start()
         except KeyboardInterrupt:
             if debug_prefix:
-                print(
-                    f"{debug_prefix} SAT start interrupted by user; "
-                    "terminating worker and returning user_abort.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s SAT start interrupted by user; terminating worker and returning user_abort.",
+                    debug_prefix,
                 )
             if p.is_alive():
                 p.terminate()
@@ -204,10 +1159,10 @@ def run_sat_with_timeout_file(
         except KeyboardInterrupt:
             if debug_prefix:
                 elapsed = time.time() - start
-                print(
-                    f"{debug_prefix} SAT join interrupted by user after "
-                    f"{elapsed:.3f}s; terminating worker (user_abort).",
-                    flush=True,
+                wise_logger.debug(
+                    "%s SAT join interrupted by user after %.3fs; terminating worker (user_abort).",
+                    debug_prefix,
+                    elapsed,
                 )
             if p.is_alive():
                 p.terminate()
@@ -220,10 +1175,11 @@ def run_sat_with_timeout_file(
         if status == "timeout":
             if debug_prefix:
                 elapsed = time.time() - start
-                print(
-                    f"{debug_prefix} SAT worker exceeded {timeout_s:.1f}s "
-                    f"(elapsed={elapsed:.3f}s); terminating (timeout).",
-                    flush=True,
+                wise_logger.debug(
+                    "%s SAT worker exceeded %.1fs (elapsed=%.3fs); terminating (timeout).",
+                    debug_prefix,
+                    timeout_s,
+                    elapsed,
                 )
             if p.is_alive():
                 p.terminate()
@@ -235,10 +1191,9 @@ def run_sat_with_timeout_file(
 
         if not os.path.exists(result_path):
             if debug_prefix:
-                print(
-                    f"{debug_prefix} SAT worker finished but produced no result file; "
-                    "treating as error.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s SAT worker finished but produced no result file; treating as error.",
+                    debug_prefix,
                 )
             return None, None, "error"
 
@@ -247,27 +1202,28 @@ def run_sat_with_timeout_file(
                 data = pickle.load(f)
         except Exception as e:
             if debug_prefix:
-                print(
-                    f"{debug_prefix} SAT worker result read error: {e!r}; "
-                    "treating as error.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s SAT worker result read error: %r; treating as error.",
+                    debug_prefix,
+                    e,
                 )
             return None, None, "error"
 
         if "error" in data:
             if debug_prefix:
-                print(
-                    f"{debug_prefix} SAT worker raised: {data['error']}; "
-                    "treating as error.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s SAT worker raised: %s; treating as error.",
+                    debug_prefix,
+                    data["error"],
                 )
             return None, None, "error"
 
         if debug_prefix:
-            print(
-                f"{debug_prefix} SAT worker finished in {data.get('time', 0.0):.3f}s, "
-                f"SAT={data.get('sat')}",
-                flush=True,
+            wise_logger.debug(
+                "%s SAT worker finished in %.3fs, SAT=%s",
+                debug_prefix,
+                data.get("time", 0.0),
+                data.get("sat"),
             )
 
         return bool(data.get("sat")), data.get("model"), "ok"
@@ -341,9 +1297,9 @@ def run_rc2_with_timeout_file(
     # If timeout <= 0, treat as "no RC2".
     if timeout_s is not None and timeout_s <= 0:
         if debug_prefix:
-            print(
-                f"{debug_prefix} RC2 disabled (timeout <= 0); treating as timeout.",
-                flush=True,
+            wise_logger.debug(
+                "%s RC2 disabled (timeout <= 0); treating as timeout.",
+                debug_prefix,
             )
         return None, None, "timeout"
 
@@ -361,20 +1317,22 @@ def run_rc2_with_timeout_file(
         p.daemon = True
 
         if debug_prefix:
-            print(
-                f"{debug_prefix} RC2 worker starting (timeout={timeout_s:.1f}s) "
-                f"for WCNF: vars={wcnf.nv}, hard={len(wcnf.hard)}, soft={len(wcnf.soft)}",
-                flush=True,
+            wise_logger.debug(
+                "%s RC2 worker starting (timeout=%.1fs) for WCNF: vars=%d, hard=%d, soft=%d",
+                debug_prefix,
+                timeout_s,
+                wcnf.nv,
+                len(wcnf.hard),
+                len(wcnf.soft),
             )
 
         try:
             p.start()
         except KeyboardInterrupt:
             if debug_prefix:
-                print(
-                    f"{debug_prefix} RC2 start interrupted by user; "
-                    "terminating worker and returning user_abort.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s RC2 start interrupted by user; terminating worker and returning user_abort.",
+                    debug_prefix,
                 )
             if p.is_alive():
                 p.terminate()
@@ -409,10 +1367,10 @@ def run_rc2_with_timeout_file(
             # Parent got Ctrl-C while waiting.
             if debug_prefix:
                 elapsed = time.time() - start
-                print(
-                    f"{debug_prefix} RC2 join interrupted by user after "
-                    f"{elapsed:.3f}s; terminating worker (user_abort).",
-                    flush=True,
+                wise_logger.debug(
+                    "%s RC2 join interrupted by user after %.3fs; terminating worker (user_abort).",
+                    debug_prefix,
+                    elapsed,
                 )
             if p.is_alive():
                 p.terminate()
@@ -425,10 +1383,11 @@ def run_rc2_with_timeout_file(
         if status == "timeout":
             if debug_prefix:
                 elapsed = time.time() - start
-                print(
-                    f"{debug_prefix} RC2 worker exceeded {timeout_s:.1f}s "
-                    f"(elapsed={elapsed:.3f}s); terminating (timeout).",
-                    flush=True,
+                wise_logger.debug(
+                    "%s RC2 worker exceeded %.1fs (elapsed=%.3fs); terminating (timeout).",
+                    debug_prefix,
+                    timeout_s,
+                    elapsed,
                 )
             if p.is_alive():
                 p.terminate()
@@ -441,10 +1400,9 @@ def run_rc2_with_timeout_file(
         # status == "finished": worker exited within timeout
         if not os.path.exists(result_path):
             if debug_prefix:
-                print(
-                    f"{debug_prefix} RC2 worker finished but wrote no result file; "
-                    "treating as error.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s RC2 worker finished but wrote no result file; treating as error.",
+                    debug_prefix,
                 )
             return None, None, "error"
 
@@ -453,27 +1411,28 @@ def run_rc2_with_timeout_file(
                 data = pickle.load(f)
         except Exception as e:
             if debug_prefix:
-                print(
-                    f"{debug_prefix} RC2 worker result read error: {e!r}; "
-                    "treating as error.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s RC2 worker result read error: %r; treating as error.",
+                    debug_prefix,
+                    e,
                 )
             return None, None, "error"
 
         if "error" in data:
             if debug_prefix:
-                print(
-                    f"{debug_prefix} RC2 worker raised: {data['error']}; "
-                    "treating as error.",
-                    flush=True,
+                wise_logger.debug(
+                    "%s RC2 worker raised: %s; treating as error.",
+                    debug_prefix,
+                    data["error"],
                 )
             return None, None, "error"
 
         if debug_prefix:
-            print(
-                f"{debug_prefix} RC2 worker finished in {data.get('time', 0.0):.3f}s, "
-                f"opt_cost={data.get('cost')}",
-                flush=True,
+            wise_logger.debug(
+                "%s RC2 worker finished in %.3fs, opt_cost=%s",
+                debug_prefix,
+                data.get("time", 0.0),
+                data.get("cost"),
             )
 
         return data.get("model"), data.get("cost"), "ok"
@@ -629,10 +1588,35 @@ class GlobalReconfigurations(Operation):
 
     @classmethod
     def physicalOperation(
-        cls, arrangement: Mapping[Trap, Sequence[Ion]], wiseArch: QCCDWiseArch, oldAssignment: Sequence[Sequence[int]], newAssignment: Sequence[Sequence[int]], schedule: List[Dict[str, Any]], initial_placement: bool = False
+        cls,
+        arrangement: Mapping[Trap, Sequence[Ion]],
+        wiseArch: QCCDWiseArch,
+        oldAssignment: Sequence[Sequence[int]],
+        newAssignment: Sequence[Sequence[int]],
+        schedule: Optional[List[Dict[str, Any]]] = None,
+        initial_placement: bool = False,
     ):
-        heatingRates, reconfigTime = cls._runOddEvenReconfig(wiseArch, arrangement, oldAssignment, newAssignment, sat_schedule=schedule, initial_placement=initial_placement)
-        reconfigTime=1e-20 if initial_placement else reconfigTime
+        # DEBUG: trace usage of schedule/sat_schedule for reconfiguration
+        # print("[DEBUG GlobalReconfigurations.physicalOperation] initial_placement =", initial_placement)
+        # if schedule is None:
+        #     print("[DEBUG GlobalReconfigurations.physicalOperation] schedule is None (likely cached block first step)")
+        # else:
+        #     try:
+        #         print("[DEBUG GlobalReconfigurations.physicalOperation] schedule len =", len(schedule))
+        #         if schedule and isinstance(schedule[0], list):
+        #             print("[DEBUG GlobalReconfigurations.physicalOperation] schedule[0] passes len =", len(schedule[0]))
+        #     except Exception as e:
+        #         print("[DEBUG GlobalReconfigurations.physicalOperation] error inspecting schedule:", repr(e))
+
+        heatingRates, reconfigTime = cls._runOddEvenReconfig(
+            wiseArch,
+            arrangement,
+            oldAssignment,
+            newAssignment,
+            sat_schedule=schedule,
+            initial_placement=initial_placement,
+        )
+        reconfigTime = 1e-20 if initial_placement else reconfigTime
         def run():
             for trap in arrangement.keys():
                 while trap.ions:
@@ -663,8 +1647,8 @@ class GlobalReconfigurations(Operation):
         wV: List[int] = None,    # unused in D-min version
         wB_col: int = 1,
         wB_row: int = 1,
-        max_rc2_time: float = 600.0,
-        max_sat_time = 1200.0,  
+        max_rc2_time: float = 150.0,
+        max_sat_time = 150.0,  
         active_ions: Set[int] = None,
         full_P_arr: List[List[Tuple[int, int]]]=[],
         ignore_initial_reconfig: bool = False,
@@ -673,6 +1657,7 @@ class GlobalReconfigurations(Operation):
         grid_origin: Tuple[int, int] = (0, 0),
         boundary_adjacent: Optional[Dict[str, bool]] = None,
         cross_boundary_prefs: Optional[List[Dict[int, Set[str]]]] = None,
+        bt_soft: bool = False,
     ) -> Tuple[List[np.ndarray], List[List[Dict[str, Any]]], int]:
         DEBUG_DIAG = True
         DEBUG_DIAG_DETAILED = False
@@ -681,6 +1666,23 @@ class GlobalReconfigurations(Operation):
         n, m = A_in.shape
         R = len(P_arr)
         optimize_round_start = 1 if (ignore_initial_reconfig and R > 0) else 0
+
+        def _apply_time_env(default_value: Optional[float], env_var: str) -> Optional[float]:
+            env_val = os.environ.get(env_var)
+            if not env_val:
+                return default_value
+            try:
+                parsed = float(env_val)
+            except ValueError:
+                return default_value
+            if parsed <= 0:
+                return default_value
+            if default_value is None or default_value <= 0:
+                return parsed
+            return min(default_value, parsed)
+
+        max_sat_time = _apply_time_env(max_sat_time, "WISE_MAX_SAT_TIME")
+        max_rc2_time = _apply_time_env(max_rc2_time, "WISE_MAX_RC2_TIME")
 
         if BT is None:
             BT = [{} for _ in range(R)]
@@ -699,6 +1701,18 @@ class GlobalReconfigurations(Operation):
 
         if cross_boundary_prefs is None or len(cross_boundary_prefs) != R:
             cross_boundary_prefs = [dict() for _ in range(R)]
+
+        bt_soft_enabled = bool(
+            bt_soft and BT and any(bt_round for bt_round in BT)
+        )
+        bt_soft_weight_value = 0
+        if bt_soft_enabled:
+            base_pref_weight = max(wB_col, wB_row, 1)
+            bt_soft_weight_value = max(100, base_pref_weight * 10)
+            if DEBUG_DIAG:
+                wise_logger.info(
+                    "[WISE] soft BT enabled: weight=%d", bt_soft_weight_value
+                )
 
         if base_pmax_in is None:
             base_pmax_in = R
@@ -739,11 +1753,11 @@ class GlobalReconfigurations(Operation):
         spectator_ions = ions_all - set(active_ions)
 
         if DEBUG_DIAG:
-            print(
-                f"[WISE] ions_all={len(ions_all)}, "
-                f"active_ions={len(active_ions)}, "
-                f"spectator_ions={len(spectator_ions)}",
-                flush=True,
+            wise_logger.debug(
+                "[WISE] ions_all=%d, active_ions=%d, spectator_ions=%d",
+                len(ions_all),
+                len(active_ions),
+                len(spectator_ions),
             )
 
         # -------------------------------
@@ -756,11 +1770,19 @@ class GlobalReconfigurations(Operation):
             for i, (d, c) in bt.items():
                 if i not in ions_all:
                     continue
-                if (d, c) in seen:
-                    raise ValueError(
-                        f"UNSAT: BT[{r}] pins ions {seen[(d,c)]} and {i} "
+                key = (d, c)
+                if key in seen:
+                    msg = (
+                        f"BT[{r}] pins ions {seen[key]} and {i} "
                         f"to the same cell (d={d}, c={c})."
                     )
+                    if bt_soft_enabled:
+                        wise_logger.warning(
+                            "UNSAT-soft: %s (will leave to Max-SAT)", msg
+                        )
+                        continue
+                    raise ValueError(f"UNSAT: {msg}")
+                seen[key] = i
 
         # (b) Pair vs BT conflicts: same round, incompatible BT rows/blocks
         for r, pairs in enumerate(P_arr):
@@ -771,13 +1793,25 @@ class GlobalReconfigurations(Operation):
                     d1, c1 = BT[r][i1]
                     d2, c2 = BT[r][i2]
                     if d1 != d2:
-                        raise ValueError(
-                            f"UNSAT: round {r} pair {(i1,i2)} BT rows differ: {d1} vs {d2}."
+                        msg = (
+                            f"round {r} pair {(i1,i2)} BT rows differ: {d1} vs {d2}."
                         )
+                        if bt_soft_enabled:
+                            wise_logger.warning(
+                                "UNSAT-soft: %s (will leave to Max-SAT)", msg
+                            )
+                            continue
+                        raise ValueError(f"UNSAT: {msg}")
                     if (c1 // k) != (c2 // k):
-                        raise ValueError(
-                            f"UNSAT: round {r} pair {(i1,i2)} BT blocks differ: {c1}//{k} vs {c2}//{k}."
+                        msg = (
+                            f"round {r} pair {(i1,i2)} BT blocks differ: {c1}//{k} vs {c2}//{k}."
                         )
+                        if bt_soft_enabled:
+                            wise_logger.warning(
+                                "UNSAT-soft: %s (will leave to Max-SAT)", msg
+                            )
+                            continue
+                        raise ValueError(f"UNSAT: {msg}")
 
         # (c) Round-0: same source row & same target column among reserved ions
         if len(BT) >= 1:
@@ -789,23 +1823,33 @@ class GlobalReconfigurations(Operation):
                 buckets.setdefault((sr, c0), []).append(i)
             bad = {key: vs for key, vs in buckets.items() if len(vs) > 1}
             if bad:
-                raise ValueError(
-                    "UNSAT: round 0 has reserved ions from the same start row "
+                msg = (
+                    "round 0 has reserved ions from the same start row "
                     f"targeting the same column: {bad}"
                 )
+                if bt_soft_enabled:
+                    wise_logger.warning(
+                        "UNSAT-soft: %s (will leave to Max-SAT)", msg
+                    )
+                else:
+                    raise ValueError(f"UNSAT: {msg}")
 
         # (d) Column oversubscription from BT
         for r, bt in enumerate(BT):
             col_counts = {}
             for i, (_, c) in bt.items():
                 if i not in ions_all:
-                    continue 
+                    continue
                 col_counts[c] = col_counts.get(c, 0) + 1
             bad_cols = {c: cnt for c, cnt in col_counts.items() if cnt > n}
             if bad_cols:
-                raise ValueError(
-                    f"UNSAT: BT[{r}] pins {bad_cols} ions to one column, exceeds n={n}."
-                )
+                msg = f"BT[{r}] pins {bad_cols} ions to one column, exceeds n={n}."
+                if bt_soft_enabled:
+                    wise_logger.warning(
+                        "UNSAT-soft: %s (will leave to Max-SAT)", msg
+                    )
+                else:
+                    raise ValueError(f"UNSAT: {msg}")
 
         ions = sorted(ions_all)
         first_block_idx = col_offset // CAPACITY
@@ -836,6 +1880,24 @@ class GlobalReconfigurations(Operation):
             )
         ions_set = set(ions)
 
+        builder_ctx = _WiseSatBuilderContext(
+            A_in=A_in,
+            BT=BT,
+            P_arr=P_arr,
+            full_P_arr=full_P_arr,
+            ions=ions,
+            n=n,
+            m=m,
+            R=R,
+            block_cells=block_cells,
+            block_fully_inside=block_fully_inside,
+            block_widths=block_widths,
+            num_blocks=num_blocks,
+            wB_col=wB_col,
+            wB_row=wB_row,
+            debug_diag=DEBUG_DIAG,
+        )
+
         def compute_outer_pairs() -> Optional[List[List[Tuple[int, int]]]]:
             if not full_P_arr:
                 return None
@@ -858,677 +1920,6 @@ class GlobalReconfigurations(Operation):
         # -------------------------------
         # Structural CNF / WCNF builder for given P_bound
         # -------------------------------
-        def _build_structural_cnf(
-            P_bound: int,
-            sum_bound_B: Optional[int] = None,
-            use_wcnf: bool = False,
-            add_boundary_soft: bool = False,
-            phase_label: str = "",
-            debug_skip_pair_constraints: bool = False,
-            debug_allow_phase_flips: bool = False,
-            optimize_round_start: int = 0,
-            debug_core: bool = False,
-            core_granularity: str = "coarse",
-            debug_skip_cardinality: bool = False,
-            debug_disable_pairs_rounds: Optional[Set[int]] = None,
-            boundary_adjacent: Optional[Dict[str, bool]] = None,
-            cross_boundary_prefs: Optional[List[Dict[int, Set[str]]]] = None,
-            boundary_capacity_factor: float = 1.0,
-        ):
-            vpool = IDPool()
-
-            # ------------- variable helpers -------------
-
-            def var_a(r, p, krow, jcol, ion):
-                return vpool.id(("a", r, p, krow, jcol, ion))
-
-            def var_s_h(r, p, krow, jcol):
-                return vpool.id(("s_h", r, p, krow, jcol))
-
-            def var_s_v(r, p, krow, jcol):
-                return vpool.id(("s_v", r, p, krow, jcol))
-
-            def var_phase(r, p):
-                return vpool.id(("phase", r, p))
-
-            def var_row_end(r, ion, d):
-                return vpool.id(("row_end", r, ion, d))
-
-            def var_w_end(r, ion, b):
-                return vpool.id(("w_end", r, ion, b))
-
-            def var_u(r, p):
-                return vpool.id(("u", r, p))
-
-            def is_reserved(r, ion):
-                return ion in BT[r]
-
-            def ion_in_full_P_arr(r, ion):
-                return any((ion in g) for g in full_P_arr[r])
-
-            def ion_in_minor_P_arr(r, ion):
-                return any((ion in g) for g in P_arr[r]) or is_reserved(r, ion)
-
-            # ------------- choose CNF or WCNF -------------
-
-            if use_wcnf:
-                formula = WCNF()
-            else:
-                formula = CNF()
-
-            grp = CoreGroups(
-                vpool=vpool,
-                enabled=(debug_core and not use_wcnf),
-                granularity=core_granularity,
-            )
-
-            def add_hard(
-                cl: List[int],
-                group_name: str,
-                meta: Optional[Dict[str, Any]] = None,
-            ) -> None:
-                if use_wcnf:
-                    formula.append(cl)
-                else:
-                    grp.add(formula, cl, group_name, meta=meta)
-
-            def add_soft(cl: List[int], weight: int = 1) -> None:
-                if use_wcnf:
-                    formula.append(cl, weight=weight)
-                else:
-                    raise RuntimeError("Soft clauses not allowed in pure CNF mode")
-
-            if debug_disable_pairs_rounds is None:
-                disable_pairs_rounds: Set[int] = set()
-            else:
-                disable_pairs_rounds = set(debug_disable_pairs_rounds)
-
-            P_bounds = ([P_bound + n + m] * optimize_round_start + [P_bound] * (R - optimize_round_start))
-
-            if boundary_adjacent is None:
-                boundary_adjacent = {
-                    "top": True,
-                    "bottom": True,
-                    "left": True,
-                    "right": True,
-                }
-            else:
-                boundary_adjacent = {
-                    "top": bool(boundary_adjacent.get("top", False)),
-                    "bottom": bool(boundary_adjacent.get("bottom", False)),
-                    "left": bool(boundary_adjacent.get("left", False)),
-                    "right": bool(boundary_adjacent.get("right", False)),
-                }
-
-            if cross_boundary_prefs is None:
-                cross_boundary_prefs_norm: List[Dict[int, Set[str]]] = [dict() for _ in range(R)]
-            else:
-                cross_boundary_prefs_norm = []
-                for r in range(R):
-                    prefs_r = cross_boundary_prefs[r] if r < len(cross_boundary_prefs) else {}
-                    normalized: Dict[int, Set[str]] = {}
-                    for ion, dirs in prefs_r.items():
-                        normalized[ion] = set(dirs)
-                    cross_boundary_prefs_norm.append(normalized)
-
-            half_h = max(1, n // 2)
-            half_w = max(1, m // 2)
-
-            def cells_for_direction(direction: str) -> List[Tuple[int, int]]:
-                cells: List[Tuple[int, int]] = []
-                if direction == "left":
-                    if not boundary_adjacent["left"]:
-                        return cells
-                    for d in range(n):
-                        for c in range(half_w):
-                            cells.append((d, c))
-                elif direction == "right":
-                    if not boundary_adjacent["right"]:
-                        return cells
-                    start = max(0, m - half_w)
-                    for d in range(n):
-                        for c in range(start, m):
-                            cells.append((d, c))
-                elif direction == "top":
-                    if not boundary_adjacent["top"]:
-                        return cells
-                    for d in range(half_h):
-                        for c in range(m):
-                            cells.append((d, c))
-                elif direction == "bottom":
-                    if not boundary_adjacent["bottom"]:
-                        return cells
-                    start = max(0, n - half_h)
-                    for d in range(start, n):
-                        for c in range(m):
-                            cells.append((d, c))
-                return cells
-
-            # ------------------------------------------------------------------
-            # (0) Global permutation: exactly one ion per cell AND each ion in exactly one cell
-            # ------------------------------------------------------------------
-            if not debug_skip_cardinality:
-                # (0a) Exactly one ion per cell (r,p,k,j)
-                for r in range(R):
-                    g_cell = f"CARD_CELL:r{r}"
-                    for p in range(P_bounds[r] + 1):
-                        for krow in range(n):
-                            for jcol in range(m):
-                                lits = [var_a(r, p, krow, jcol, ion) for ion in ions]
-                                enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                                for cl in enc.clauses:
-                                    add_hard(cl, g_cell)
-
-                g_cell_final = "CARD_CELL:FINAL"
-                for krow in range(n):
-                    for jcol in range(m):
-                        lits = [var_a(R, 0, krow, jcol, ion) for ion in ions]
-                        enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                        for cl in enc.clauses:
-                            add_hard(cl, g_cell_final)
-
-                # (0b) Each ion occupies exactly one cell (k,j) at every (r,p)
-                for r in range(R):
-                    g_ion_r = f"CARD_ION:r{r}"
-                    for p in range(P_bounds[r] + 1):
-                        for ion in ions:
-                            lits = [var_a(r, p, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
-                            enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                            for cl in enc.clauses:
-                                add_hard(cl, g_ion_r)
-
-                g_ion_final = "CARD_ION:FINAL"
-                for ion in ions:
-                    lits = [var_a(R, 0, krow, jcol, ion) for krow in range(n) for jcol in range(m)]
-                    enc = CardEnc.equals(lits=lits, encoding=EncType.ladder, vpool=vpool)
-                    for cl in enc.clauses:
-                        add_hard(cl, g_ion_final)
-
-            # ------------------------------------------------------------------
-            # (1) Initial layout and inter-round chaining
-            # ------------------------------------------------------------------
-
-            # (1a) Initial layout: a[0,0] equals A_in
-            for krow in range(n):
-                for jcol in range(m):
-                    ion0 = int(A_in[krow, jcol])
-                    # Ion ion0 must be there
-                    add_hard([var_a(0, 0, krow, jcol, ion0)], "INIT")
-                    # No other ion may be there at (0,0)
-                    for ion in ions:
-                        if ion != ion0:
-                            add_hard([-var_a(0, 0, krow, jcol, ion)], "INIT")
-
-            # (1b) Chaining: a[r+1,0] <-> a[r,P_bounds[r]] for r=0..R-1
-            for r in range(R):
-                g_chain_r = f"CHAIN:r{r}"
-                for krow in range(n):
-                    for jcol in range(m):
-                        for ion in ions:
-                            a_next = var_a(r + 1, 0, krow, jcol, ion)
-                            a_end  = var_a(r, P_bounds[r], krow, jcol, ion)
-                            add_hard([-a_next, a_end], g_chain_r)
-                            add_hard([-a_end, a_next], g_chain_r)
-
-            # ------------------------------------------------------------------
-            # (2) BT pinning at end-of-round (FINAL STATE ONLY)
-            # ------------------------------------------------------------------
-
-            for r in range(R):
-                for ion in ions:
-                    if is_reserved(r, ion):
-                        d_fix, c_fix = BT[r][ion]
-                        # Ion must occupy (d_fix,c_fix) at end-of-round r
-                        add_hard([var_a(r, P_bounds[r], d_fix, c_fix, ion)], "BT")
-                        # Ion cannot be anywhere else at end-of-round r
-                        for krow in range(n):
-                            for jcol in range(m):
-                                if (krow, jcol) != (d_fix, c_fix):
-                                    add_hard([-var_a(r, P_bounds[r], krow, jcol, ion)], "BT")
-
-            # ------------------------------------------------------------------
-            # (3) Phase structure: horizontal -> vertical
-            # ------------------------------------------------------------------
-
-            # (3a) Monotonicity: phase[r,p] -> phase[r,p+1] for each round r
-            if not debug_allow_phase_flips:
-                for r in range(R):
-                    if P_bounds[r] > 1:
-                        for p in range(P_bounds[r] - 1):
-                            add_hard([-var_phase(r, p), var_phase(r, p + 1)], "PHASE_MONO")
-
-            # ------------------------------------------------------------------
-            # (4) Horizontal and (5) Vertical comparators + semantics + copy constraints
-            # ------------------------------------------------------------------
-
-            for r in range(R):
-                for p in range(P_bounds[r]):
-                    phase_p = var_phase(r,p)
-
-                    # ---------------- Horizontal comparators (row-wise) ----------------
-                    for krow in range(n):
-                        for jcol in range(m - 1):
-                            sh = var_s_h(r, p, krow, jcol)
-
-                            # Gating: if phase[p] = 1 (vertical), horizontal comparators must be off
-                            # phase[p] = 1 ⇒ ¬s_h  ==  (¬phase[p] ∨ ¬s_h)
-                            add_hard([-phase_p, -sh], "H_GATE")
-
-                            # Parity (odd-even) for horizontal comparisons:
-                            # here we just use p%2 as horizontal parity:
-                            #   if jcol % 2 != p % 2 then s_h must be 0
-                            if jcol % 2 != (p % 2):
-                                add_hard([-sh], "H_GATE")
-
-                            # Forward-only SWAP semantics between (krow,jcol) and (krow,jcol+1)
-                            # NOTE: we ONLY constrain the s=1 (swap) case here.
-                            #       The s=0 (identity) case is handled by the horizontal copy
-                            #       constraints below, which are guarded on ¬phase and ¬s_left/¬s_right.
-                            for ion in ions:
-                                a_cur_j = var_a(r, p, krow, jcol, ion)
-                                a_cur_j1 = var_a(r, p, krow, jcol + 1, ion)
-                                a_next_j = var_a(r, p + 1, krow, jcol, ion)
-                                a_next_j1 = var_a(r, p + 1, krow, jcol + 1, ion)
-
-                                # (H3) If s=1 and ion is in right cell at p, it must be in left at p+1:
-                                #      (s ∧ a_cur_j1) -> a_next_j
-                                add_hard([-sh, -a_cur_j1, a_next_j], "H_SEM")
-
-                                # (H4) If s=1 and ion is in left cell at p, it must be in right at p+1:
-                                #      (s ∧ a_cur_j) -> a_next_j1
-                                add_hard([-sh, -a_cur_j, a_next_j1], "H_SEM")
-
-                    # ---------------- Vertical comparators (column-wise) ----------------
-                    for krow in range(n - 1):
-                        for jcol in range(m):
-                            sv = var_s_v(r, p, krow, jcol)
-
-                            # Gating: if phase[p] = 0 (horizontal), vertical comparators must be off
-                            # phase[p] = 0 ⇒ ¬s_v  ==  (phase[p] ∨ ¬s_v)
-                            add_hard([phase_p, -sv], "V_GATE")
-
-                            # Parity (odd-even) for vertical comparisons, using p%2 as v-index:
-                            #   if krow % 2 != p % 2 then s_v must be 0
-                            if krow % 2 != (p % 2):
-                                add_hard([-sv], "V_GATE")
-
-                            # Forward-only SWAP semantics between (krow,jcol) and (krow+1,jcol)
-                            # Again, ONLY the s=1 case is constrained here; s=0 is enforced by
-                            # the vertical copy constraints (phase ∧ ¬s_up ∧ ¬s_down).
-                            for ion in ions:
-                                a_cur_top = var_a(r, p, krow, jcol, ion)
-                                a_cur_bot = var_a(r, p, krow + 1, jcol, ion)
-                                a_next_top = var_a(r, p + 1, krow, jcol, ion)
-                                a_next_bot = var_a(r, p + 1, krow + 1, jcol, ion)
-
-                                # (V3) If s=1 and ion is in bottom cell at p, it must be in top at p+1:
-                                #      (s ∧ a_cur_bot) -> a_next_top
-                                add_hard([-sv, -a_cur_bot, a_next_top], "V_SEM")
-
-                                # (V4) If s=1 and ion is in top cell at p, it must be in bottom at p+1:
-                                #      (s ∧ a_cur_top) -> a_next_bot
-                                add_hard([-sv, -a_cur_top, a_next_bot], "V_SEM")
-
-            # -------- Copy constraints for non-participating cells (horizontal phase) --------
-            for r in range(R):
-                for p in range(P_bounds[r]):
-                    phase_p = var_phase(r,p)
-                    for krow in range(n):
-                        for jcol in range(m):
-                            # horizontal comparators that touch (krow,jcol)
-                            s_left = var_s_h(r, p, krow, jcol - 1) if jcol > 0 else None
-                            s_right = var_s_h(r, p, krow, jcol) if jcol < m - 1 else None
-
-                            # antecedent: (¬phase[p] ∧ ¬s_left ∧ ¬s_right)
-                            lits_ante_neg = [phase_p]  # this is ¬(¬phase), used on the clause side
-
-                            if s_left is not None:
-                                lits_ante_neg.append(s_left)
-                            if s_right is not None:
-                                lits_ante_neg.append(s_right)
-
-                            for ion in ions:
-                                a_cur = var_a(r, p, krow, jcol, ion)
-                                a_next = var_a(r, p + 1, krow, jcol, ion)
-
-                                # (¬phase ∧ ¬s_left ∧ ¬s_right ∧ a_cur) -> a_next
-                                # CNF: (phase ∨ s_left ∨ s_right ∨ ¬a_cur ∨ a_next)
-                                add_hard(lits_ante_neg + [-a_cur, a_next], "H_COPY")
-
-                                # (¬phase ∧ ¬s_left ∧ ¬s_right ∧ a_next) -> a_cur
-                                # CNF: (phase ∨ s_left ∨ s_right ∨ ¬a_next ∨ a_cur)
-                                add_hard(lits_ante_neg + [-a_next, a_cur], "H_COPY")
-
-            # -------- Copy constraints for non-participating cells (vertical phase) --------
-            for r in range(R):
-                for p in range(P_bounds[r]):
-                    phase_p = var_phase(r,p)
-                    for krow in range(n):
-                        for jcol in range(m):
-                            # vertical comparators that touch (krow,jcol)
-                            s_up = var_s_v(r, p, krow - 1, jcol) if krow > 0 else None
-                            s_down = var_s_v(r, p, krow, jcol) if krow < n - 1 else None
-
-                            # antecedent: (phase[p] ∧ ¬s_up ∧ ¬s_down)
-                            lits_ante_neg = [-phase_p]  # this is ¬phase on the clause side
-
-                            if s_up is not None:
-                                lits_ante_neg.append(s_up)
-                            if s_down is not None:
-                                lits_ante_neg.append(s_down)
-
-                            for ion in ions:
-                                a_cur = var_a(r, p, krow, jcol, ion)
-                                a_next = var_a(r, p + 1, krow, jcol, ion)
-
-                                # (phase ∧ ¬s_up ∧ ¬s_down ∧ a_cur) -> a_next
-                                # CNF: (¬phase ∨ s_up ∨ s_down ∨ ¬a_cur ∨ a_next)
-                                add_hard(lits_ante_neg + [-a_cur, a_next], "V_COPY")
-
-                                # (phase ∧ ¬s_up ∧ ¬s_down ∧ a_next) -> a_cur
-                                # CNF: (¬phase ∨ s_up ∨ s_down ∨ ¬a_next ∨ a_cur)
-                                add_hard(lits_ante_neg + [-a_next, a_cur], "V_COPY")
-
-            # ------------------------------------------------------------------
-            # (5) End-of-round row/block abstraction and pair constraints
-            # ------------------------------------------------------------------
-
-            for r in range(R):
-                g_rb_r = f"ROWBLOCK_LINK:r{r}"
-                g_pair_r = f"PAIR_REQ:r{r}"
-
-                # row_end / w_end linkage from final layout a[r,P_bounds[r]]
-                for ion in ions:
-                    # row_end
-                    for d in range(n):
-                        re = var_row_end(r, ion, d)
-                        cell_lits = [var_a(r, P_bounds[r], d, j, ion) for j in range(m)]
-                        add_hard([-re] + cell_lits, g_rb_r)
-                        for aj in cell_lits:
-                            add_hard([-aj, re], g_rb_r)
-
-                    # w_end (global block alignment)
-                    for b_local in range(num_blocks):
-                        we = var_w_end(r, ion, b_local)
-                        cell_list = block_cells[b_local]
-                        cells = [var_a(r, P_bounds[r], d, j_local, ion) for (d, j_local) in cell_list]
-                        if block_fully_inside[b_local] or (block_widths[b_local]>1):
-                            add_hard([-we] + cells, g_rb_r)
-                            for aj in cells:
-                                add_hard([-aj, we], g_rb_r)
-                        else:
-                            add_hard([-we], g_rb_r)
-
-                # Pairs must share same row and block (unless skipping for debug)
-                if not debug_skip_pair_constraints:
-                    if r in disable_pairs_rounds:
-                        pass
-                    else:
-                        for (i1, i2) in P_arr[r]:
-                            if i1 not in ions or i2 not in ions:
-                                continue
-
-                            # Same row
-                            for d in range(n):
-                                re1 = var_row_end(r, i1, d)
-                                re2 = var_row_end(r, i2, d)
-                                add_hard([-re1, re2], g_pair_r)
-                                add_hard([-re2, re1], g_pair_r)
-                            # Same block (global aligned); only enforce for fully covered blocks
-                            for b_local in range(num_blocks):
-                                we1 = var_w_end(r, i1, b_local)
-                                we2 = var_w_end(r, i2, b_local)
-                                add_hard([-we1, we2], g_pair_r)
-                                add_hard([-we2, we1], g_pair_r)
-
-            # ------------------------------------------------------------------
-            # (6) Optional Level-3 soft clauses (boundary avoidance, swap-cost)
-            # ------------------------------------------------------------------
-            if use_wcnf and add_boundary_soft and (wB_row > 0 or wB_col > 0):
-                inner_ions_per_round: List[Set[int]] = []
-                for r in range(R):
-                    inner_ions = set()
-                    for (i1, i2) in P_arr[r]:
-                        inner_ions.add(i1)
-                        inner_ions.add(i2)
-                    inner_ions.update(BT[r].keys())
-                    inner_ions_per_round.append(inner_ions)
-
-                for r in range(R):
-                    inner_ions = inner_ions_per_round[r]
-                    cross_prefs_r = cross_boundary_prefs[r] if r < len(cross_boundary_prefs) else {}
-                    for ion in ions:
-                        dirs = cross_prefs_r.get(ion)
-                        if dirs:
-                            for direction in dirs:
-                                if direction in ("left", "right") and wB_col > 0:
-                                    if not boundary_adjacent.get(direction, False):
-                                        continue
-                                    target_col = 0 if direction == "left" else m - 1
-                                    lits = [var_a(r, P_bounds[r], d, target_col, ion) for d in range(n)]
-                                    if lits:
-                                        add_soft(lits, weight=wB_col)
-                                if direction in ("top", "bottom") and wB_row > 0:
-                                    if not boundary_adjacent.get(direction, False):
-                                        continue
-                                    target_row = 0 if direction == "top" else n - 1
-                                    lits = [var_a(r, P_bounds[r], target_row, jcol, ion) for jcol in range(m)]
-                                    if lits:
-                                        add_soft(lits, weight=wB_row)
-
-                        if ion in inner_ions:
-                            if boundary_adjacent.get("left", False) and wB_col > 0:
-                                for d in range(n):
-                                    add_soft([-var_a(r, P_bounds[r], d, 0, ion)], weight=wB_col)
-                            if boundary_adjacent.get("right", False) and wB_col > 0:
-                                for d in range(n):
-                                    add_soft([-var_a(r, P_bounds[r], d, m - 1, ion)], weight=wB_col)
-                            if boundary_adjacent.get("top", False) and wB_row > 0:
-                                for jcol in range(m):
-                                    add_soft([-var_a(r, P_bounds[r], 0, jcol, ion)], weight=wB_row)
-                            if boundary_adjacent.get("bottom", False) and wB_row > 0:
-                                for jcol in range(m):
-                                    add_soft([-var_a(r, P_bounds[r], n - 1, jcol, ion)], weight=wB_row)
-
-            if cross_boundary_prefs_norm and any(boundary_adjacent.values()):
-                factor = max(0.0, min(1.0, boundary_capacity_factor))
-                dir_capacity: Dict[str, int] = {}
-                if boundary_adjacent.get("top", False):
-                    dir_capacity["top"] = int(round(half_h * m * factor))
-                if boundary_adjacent.get("bottom", False):
-                    dir_capacity["bottom"] = int(round(half_h * m * factor))
-                if boundary_adjacent.get("left", False):
-                    dir_capacity["left"] = int(round(half_w * n * factor))
-                if boundary_adjacent.get("right", False):
-                    dir_capacity["right"] = int(round(half_w * n * factor))
-
-                ions_per_round_dir: Dict[Tuple[int, str], List[int]] = defaultdict(list)
-                for r, prefs_r in enumerate(cross_boundary_prefs_norm):
-                    for ion, dirs in prefs_r.items():
-                        for direction in dirs:
-                            if direction in dir_capacity:
-                                ions_per_round_dir[(r, direction)].append(ion)
-
-                for key in ions_per_round_dir:
-                    ions_per_round_dir[key].sort()
-
-                enforced_dirs_per_ion: Dict[Tuple[int, int], Set[str]] = defaultdict(set)
-                for (r, direction), ion_list in ions_per_round_dir.items():
-                    cap = dir_capacity.get(direction, 0)
-                    if cap <= 0:
-                        continue
-                    for ion in ion_list[:cap]:
-                        enforced_dirs_per_ion[(r, ion)].add(direction)
-
-                def _band_cells_for_dirs(directions: Set[str]) -> List[Tuple[int, int]]:
-                    row_min, row_max = 0, n - 1
-                    col_min, col_max = 0, m - 1
-                    if "top" in directions:
-                        row_max = min(row_max, half_h - 1)
-                    if "bottom" in directions:
-                        row_min = max(row_min, n - half_h)
-                    if "left" in directions:
-                        col_max = min(col_max, half_w - 1)
-                    if "right" in directions:
-                        col_min = max(col_min, m - half_w)
-                    if row_min > row_max or col_min > col_max:
-                        return []
-                    return [
-                        (rr, cc)
-                        for rr in range(row_min, row_max + 1)
-                        for cc in range(col_min, col_max + 1)
-                    ]
-
-                for r in range(R):
-                    prefs_r = cross_boundary_prefs_norm[r]
-                    if not prefs_r:
-                        continue
-                    P_final = P_bounds[r]
-                    for ion in prefs_r.keys():
-                        enforced_dirs = enforced_dirs_per_ion.get((r, ion))
-                        if not enforced_dirs:
-                            continue
-                        cells = _band_cells_for_dirs(enforced_dirs)
-                        if not cells:
-                            union_cells: Set[Tuple[int, int]] = set()
-                            for direction in enforced_dirs:
-                                union_cells.update(_band_cells_for_dirs({direction}))
-                            cells = list(union_cells)
-                        if not cells:
-                            if DEBUG_DIAG:
-                                print(
-                                    f"[CROSS_BOUNDARY] no valid cells for ion {ion} round {r} dirs={sorted(enforced_dirs)}; skipping",
-                                    flush=True,
-                                )
-                            continue
-                        clause = [var_a(r, P_final, d, c, ion) for (d, c) in cells]
-                        add_hard(clause, "CROSS_BOUNDARY")
-
-            # -------------------------------
-            # Per-round pass usage helpers (u) and global Σ_r P_r bound
-            # -------------------------------
-            # Keep u[r,p] as-is: u <-> (OR of comparators)
-            for r in range(R):
-                for p in range(P_bounds[r]):
-                    u_rp = var_u(r, p)
-
-                    comp_lits: List[int] = []
-                    for krow in range(n):
-                        for jcol in range(m - 1):
-                            comp_lits.append(var_s_h(r, p, krow, jcol))
-                    for krow in range(n - 1):
-                        for jcol in range(m):
-                            comp_lits.append(var_s_v(r, p, krow, jcol))
-
-                    if not comp_lits:
-                        # No comparators exist at all in this pass: u must be false.
-                        add_hard([-u_rp], "UTIL_U")
-                        continue
-
-                    # u[r,p] ↔ OR(comp_lits)
-                    add_hard([-u_rp] + comp_lits, "UTIL_U")
-                    for s_lit in comp_lits:
-                        add_hard([-s_lit, u_rp], "UTIL_U")
-
-            if sum_bound_B is not None and optimize_round_start < R:
-                sum_u_lits: List[int] = []
-                for r in range(optimize_round_start, R):
-                    for p in range(P_bounds[r]):
-                        sum_u_lits.append(var_u(r, p))
-
-                total_slots = len(sum_u_lits)
-                bound = min(sum_bound_B, total_slots)
-                if bound < total_slots:
-                    card_enc = CardEnc.atmost(
-                        lits=sum_u_lits,
-                        bound=bound,
-                        encoding=EncType.totalizer,
-                        vpool=vpool,
-                    )
-                    for clause in card_enc.clauses:
-                        add_hard(clause, "SUM_BOUND")
-
-            selectors = grp.sel if grp.enabled else {}
-            group_meta = grp.meta if grp.enabled else {}
-            return formula, vpool, ions, var_a, selectors, group_meta
-     
-
-        def decode_wise_schedule_from_model(
-            model: List[int],
-            vpool,
-            n: int,
-            m: int,
-            R: int,
-            P_bound: int,
-        ) -> List[List[Dict[str, Any]]]:
-            model_set = {lit for lit in model if lit > 0}
-            P_bounds = ([P_bound+n+m]*int(ignore_initial_reconfig) + [P_bound]*(R-int(ignore_initial_reconfig)))
-
-            def lit_true(v: int) -> bool:
-                return v in model_set
-
-            def var_s_h(r, p, krow, jcol):
-                return vpool.id(("s_h", r, p, krow, jcol))
-
-            def var_s_v(r, p, krow, jcol):
-                return vpool.id(("s_v", r, p, krow, jcol))
-
-            def var_phase(r, p):
-                return vpool.id(("phase", r, p))
-
-            schedule: List[List[Dict[str, Any]]] = [[] for _ in range(R)]
-            for r in range(R):
-                for p in range(P_bounds[r]):
-                    phase_lit = var_phase(r, p)
-                    is_vertical = (phase_lit <= vpool.top and lit_true(phase_lit))
-                    phase = "V" if is_vertical else "H"
-
-                    pass_info: Dict[str, Any] = {
-                        "phase": phase,
-                        "h_swaps": [],
-                        "v_swaps": [],
-                    }
-
-                    if phase == "H":
-                        # Horizontal comparators at this pass
-                        for krow in range(n):
-                            for jcol in range(m - 1):
-                                v = var_s_h(r, p, krow, jcol)
-                                if v <= vpool.top and lit_true(v):
-                                    pass_info["h_swaps"].append((krow, jcol))
-                    else:
-                        # Vertical comparators at this pass
-                        for krow in range(n - 1):
-                            for jcol in range(m):
-                                v = var_s_v(r, p, krow, jcol)
-                                if v <= vpool.top and lit_true(v):
-                                    pass_info["v_swaps"].append((krow, jcol))
-
-                    schedule[r].append(pass_info)
-
-            return schedule
-
-        def extract_round_pass_usage(model, vpool, R, P_bound):
-            model_set = {lit for lit in model if lit > 0}
-            P_bounds = ([P_bound+n+m]*int(ignore_initial_reconfig) + [P_bound]*(R-int(ignore_initial_reconfig)))
-
-            def lit_true(v: int) -> bool:
-                return v in model_set
-
-            def var_u(r, p):
-                return vpool.id(("u", r, p))
-
-            per_round: List[int] = []
-            for r in range(R):
-                count = 0
-                for p in range(P_bounds[r]):
-                    u_lit = var_u(r, p)
-                    if u_lit <= vpool.top and lit_true(u_lit):
-                        count += 1
-                per_round.append(count)
-
-            return per_round
-
         def wise_debug_boundary_stats(
             label: str,
             model: Iterable[int],
@@ -1690,14 +2081,20 @@ class GlobalReconfigurations(Operation):
                 "per_ion_counts": per_ion_counts,
             }
 
-            print(
-                f"[WISE-DEBUG] boundary-stats {label}: "
-                f"subgrid={n_sub}x{m_sub}, "
-                f"pos={total_positions}, "
-                f"row_hits={boundary_hits_row} ({summary['frac_row']:.3f}), "
-                f"col_hits={boundary_hits_col} ({summary['frac_col']:.3f}), "
-                f"corner_hits={boundary_hits_corner} ({summary['frac_corner']:.3f}), "
-                f"adjacent={boundary_adjacent}"
+            wise_logger.debug(
+                "[WISE-DEBUG] boundary-stats %s: subgrid=%dx%d, pos=%d, row_hits=%d (%.3f), "
+                "col_hits=%d (%.3f), corner_hits=%d (%.3f), adjacent=%s",
+                label,
+                n_sub,
+                m_sub,
+                total_positions,
+                boundary_hits_row,
+                summary["frac_row"],
+                boundary_hits_col,
+                summary["frac_col"],
+                boundary_hits_corner,
+                summary["frac_corner"],
+                boundary_adjacent,
             )
 
             worst = sorted(
@@ -1710,13 +2107,17 @@ class GlobalReconfigurations(Operation):
                     continue
                 fr = stats["row"] / stats["total"]
                 fc = stats["col"] / stats["total"]
-                print(
-                    f"[WISE-DEBUG]   ion {ion}: total={stats['total']}, "
-                    f"row={stats['row']} ({fr:.3f}), "
-                    f"col={stats['col']} ({fc:.3f}), "
-                    f"corner={stats['corner']}, "
-                    f"inner_hits={stats['inner_hits']}, "
-                    f"outer_hits={stats['outer_hits']}"
+                wise_logger.debug(
+                    "[WISE-DEBUG]   ion %d: total=%d, row=%d (%.3f), col=%d (%.3f), corner=%d, inner_hits=%d, outer_hits=%d",
+                    ion,
+                    stats["total"],
+                    stats["row"],
+                    fr,
+                    stats["col"],
+                    fc,
+                    stats["corner"],
+                    stats["inner_hits"],
+                    stats["outer_hits"],
                 )
 
             return summary
@@ -1733,6 +2134,8 @@ class GlobalReconfigurations(Operation):
             Enumerate (P_max, boundary_capacity_factor) pairs. The capacity factor
             scales the number of ions that are forced into boundary bands for
             CROSS_BOUNDARY constraints. The final factor is capacity_min (typically 0).
+            Each worker now performs its own Σ_r P_r search, so we no longer enumerate
+            sum_bound_B here.
             """
             if capacity_steps <= 1:
                 factors = [1.0]
@@ -1749,305 +2152,211 @@ class GlobalReconfigurations(Operation):
                 for factor in factors:
                     yield (P_max, factor)
 
-        chosen_solution = None
-        base_pmax = max(max(base_pmax_in, 1), prev_pmax)
-        limit_pmax = base_pmax + n + m
-        configs = _enumerate_pmax_configs(
-            base_pmax,
-            limit_pmax,
-            step=max(int(np.floor((limit_pmax-base_pmax)/4)),1),
-            capacity_steps=6,
-            capacity_min=0.0,
+
+        base_pmax = max(base_pmax_in, 1)
+        limit_pmax = max(base_pmax, prev_pmax) + n + m
+        configs = list(
+            _enumerate_pmax_configs(
+                base_pmax,
+                limit_pmax,
+                step=max(int(np.floor((limit_pmax - base_pmax) / 4)), 1),
+                capacity_steps=6,
+                capacity_min=0.0,
+            )
         )
+        if not configs:
+            raise NoFeasibleLayoutError("No feasible layout: empty SAT configuration set.")
 
-        chosen_boundary_capacity_factor = 1.0
+        if DEBUG_DIAG:
+            wise_logger.info(
+                "[WISE] launching SAT pool over %d configs (P_max∈[%d, %d])",
+                len(configs),
+                base_pmax,
+                limit_pmax,
+            )
 
-        for (P_max, boundary_capacity_factor) in configs:
-            rounds_under_sum_local = max(1, R - optimize_round_start)
-            B_lo = 0
-            B_hi = rounds_under_sum_local * P_max
-            sum_star = None
+        try:
+            pool_context = mp.get_context("fork")
+        except ValueError:
+            pool_context = mp.get_context()
 
-            if DEBUG_DIAG:
-                print(
-                    f"[WISE] starting binary search for ΣP in [{B_lo}, {B_hi}] "
-                    f"(opt rounds start={optimize_round_start}) with P_max={P_max}, "
-                    f"boundary_capacity_factor={boundary_capacity_factor:.2f}",
-                    flush=True,
-                )
+        try:
+            available_cpus = pool_context.cpu_count()
+        except (AttributeError, NotImplementedError):
+            available_cpus = mp.cpu_count()
+        if available_cpus is None or available_cpus <= 0:
+            available_cpus = 1
 
-            while B_lo <= B_hi:
-                B_mid = (B_lo + B_hi) // 2
+        max_workers = max(1, min(len(configs), available_cpus))
 
-                (
-                    cnf_mid,
-                    vpool_mid,
-                    ions_mid,
-                    var_a_mid,
-                    grp_sel_mid,
-                    grp_meta_mid,
-                ) = _build_structural_cnf(
-                    P_max,
-                    sum_bound_B=B_mid,
-                    use_wcnf=False,
-                    add_boundary_soft=False,
-                    phase_label=f"ΣP={B_mid}/SAT",
+        # NEW: cap by env var WISE_SAT_WORKERS if present
+        _env_cap = os.environ.get("WISE_SAT_WORKERS")
+        if _env_cap is not None:
+            try:
+                cap = int(_env_cap)
+                if cap > 0:
+                    max_workers = max(1, min(max_workers, cap))
+            except ValueError:
+                # ignore bad value
+                pass
+
+        results: List[Dict[str, Any]] = []
+        solver_timeout = max_rc2_time if bt_soft_enabled else max_sat_time
+        global_budget_s = (
+            solver_timeout * 2.0 if (solver_timeout is not None and solver_timeout > 0) else None
+        )
+        start_pool = time.time()
+        progress_dir = tempfile.mkdtemp(prefix="wise_sat_pool_")
+        progress_paths: Dict[int, str] = {}
+        executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=pool_context)
+        futures: List[Tuple[int, Tuple[int, float], Any]] = []
+        try:
+            for idx, cfg in enumerate(configs):
+                progress_path = os.path.join(progress_dir, f"cfg_{idx}.pkl")
+                progress_paths[idx] = progress_path
+                fut = executor.submit(
+                    _wise_sat_config_worker,
+                    cfg,
+                    context=builder_ctx,
                     optimize_round_start=optimize_round_start,
-                    debug_core=True,
-                    core_granularity="coarse",
-                    debug_skip_cardinality=False,
+                    max_sat_time=max_sat_time,
+                    max_rc2_time=max_rc2_time,
                     boundary_adjacent=boundary_adjacent,
                     cross_boundary_prefs=cross_boundary_prefs,
-                    boundary_capacity_factor=boundary_capacity_factor,
+                    ignore_initial_reconfig=ignore_initial_reconfig,
+                    progress_path=progress_path,
+                    bt_soft_weight=bt_soft_weight_value,
                 )
+                futures.append((idx, cfg, fut))
 
-                assumptions_mid = (
-                    [-lit for lit in grp_sel_mid.values()] if grp_sel_mid else None
-                )
+            while True:
+                unfinished = [1 for _, _, fut in futures if not fut.done()]
+                if not unfinished:
+                    break
+                if (
+                    global_budget_s is not None
+                    and (time.time() - start_pool) >= global_budget_s
+                ):
+                    if DEBUG_DIAG:
+                        wise_logger.info(
+                            "[WISE] global SAT pool budget exhausted; collecting best-so-far results and cancelling remaining workers."
+                        )
+                    break
+                time.sleep(0.05)
 
-                t_sat_start = time.time()
-                sat_ok, model_mid, status_sat = run_sat_with_timeout_file(
-                    cnf_mid,
-                    timeout_s=max_sat_time,
-                    debug_prefix=None,
-                    assumptions=assumptions_mid,
-                )
-
-                # with Minisat22(bootstrap_with=cnf_mid.clauses) as sat:
-                #     sat_ok = sat.solve(assumptions=assumptions_mid)
-                #     model_mid = sat.get_model() if sat_ok else None
-                #     status_sat = "ok" if sat_ok else "error"
-                t_sat_end = time.time()
-
-                if DEBUG_DIAG:
-                    if hasattr(cnf_mid, "clauses"):
-                        n_clauses = len(cnf_mid.clauses)
-                    else:
-                        n_clauses = len(cnf_mid.hard)  # just in case
-                    print(
-                        f"[WISE]  test ΣP={B_mid}, P_max={P_max}: status={status_sat}, SAT={sat_ok}, "
-                        f"vars={vpool_mid.top}, clauses={n_clauses}, "
-                        f"time={t_sat_end - t_sat_start:.3f}s",
-                        flush=True,
-                    )
-                 
-                if sat_ok:
-                    chosen_solution = (
-                        cnf_mid,
-                        vpool_mid,
-                        ions_mid,
-                        var_a_mid,
-                        model_mid,
-                        B_mid,
-                        P_max,
-                        boundary_capacity_factor,
-                    )
-                    chosen_boundary_capacity_factor = boundary_capacity_factor
-                    # Record this as the best so far and tighten upper bound
-                    sum_star = B_mid
-                    B_hi = B_mid - 1
+            for idx, cfg, fut in futures:
+                if fut.done():
+                    try:
+                        res = fut.result()
+                        results.append(res)
+                        if DEBUG_DIAG:
+                            usage = res.get("per_round_usage") or [1e9]
+                            sum_usage = int(sum(usage[(optimize_round_start * (R > 1)):]))
+                            wise_logger.info(
+                                "[WISE] pool result: P_max=%s, sum_usage=%d cap_factor=%.2f, status=%s, sat=%s",
+                                res.get("P_max"),
+                                sum_usage,
+                                res.get("boundary_capacity_factor", float("nan")),
+                                res.get("status"),
+                                res.get("sat"),
+                            )
+                    except Exception as e:
+                        if DEBUG_DIAG:
+                            wise_logger.warning("[WISE] config %s crashed: %s", cfg, e)
                 else:
-                    # try:
-                    #     with Minisat22(bootstrap_with=cnf_mid.clauses) as s:
-                    #         assumptions = [-lit for lit in grp_sel_mid.values()]
-                    #         ok = s.solve(assumptions=assumptions)
-                    #         if not ok:
-                    #             core = s.get_core() or []
-                    #             inv = {lit: name for name, lit in grp_sel_mid.items()}
+                    progress_path = progress_paths.get(idx)
+                    if progress_path and os.path.exists(progress_path):
+                        try:
+                            with open(progress_path, "rb") as f:
+                                res = pickle.load(f)
+                            results.append(res)
+                            if DEBUG_DIAG:
+                                usage = res.get("per_round_usage") or [1e9]
+                                sum_usage = int(sum(usage[(optimize_round_start * (R > 1)):]))
+                                wise_logger.info(
+                                    "[WISE] partial result (timeout): P_max=%s, sum_usage=%d cap_factor=%.2f, status=%s, sat=%s",
+                                    res.get("P_max"),
+                                    sum_usage,
+                                    res.get("boundary_capacity_factor", float("nan")),
+                                    res.get("status"),
+                                    res.get("sat")
+                                )
+                        except Exception:
+                            pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            shutil.rmtree(progress_dir, ignore_errors=True)
 
-                    #             by_group: Dict[str, Set[int]] = {}
-                    #             culprit_rounds: Set[int] = set()
-                    #             culprit_fullnames: List[str] = []
+        sat_results = [
+            r for r in results if r.get("sat") and r.get("status") == "ok"
+        ]
 
-                    #             for a in core:
-                    #                 var = abs(a)
-                    #                 fullname = inv.get(var)
-                    #                 if fullname is None:
-                    #                     continue
-                    #                 culprit_fullnames.append(fullname)
-                    #                 parts = fullname.split(":")
-                    #                 base = parts[0]
+        if not sat_results:
+            raise NoFeasibleLayoutError(
+                f"No feasible layout for any Σ_r P_r bound over {len(configs)} configs."
+            )
 
-                    #                 rounds_here: Set[int] = set()
-                    #                 for part in parts[1:]:
-                    #                     if part.startswith("r"):
-                    #                         try:
-                    #                             rounds_here.add(int(part[1:]))
-                    #                         except ValueError:
-                    #                             pass
+        def _score_config(res: Dict[str, Any]) -> Tuple[int, float, int]:
+            usage = res.get("per_round_usage") or [1e9]
+            sum_usage = int(sum(usage[(optimize_round_start*(R>1)):]))
+            return (
+                -res["boundary_capacity_factor"],
+                sum_usage,
+                -res["P_max"]
+            )
 
-                    #                 if rounds_here:
-                    #                     by_group.setdefault(base, set()).update(rounds_here)
-                    #                     culprit_rounds.update(rounds_here)
-                    #                 else:
-                    #                     by_group.setdefault(base, set())
+        best_res = min(sat_results, key=_score_config)
+        best_usage = best_res.get("per_round_usage") or []
+        best_sum_bound = int(sum(best_usage))
+        chosen_boundary_capacity_factor = best_res["boundary_capacity_factor"]
+        P_max = best_res["P_max"]
+        sat_model_star = best_res.get("model")
 
-                    #             # High-level summary
-                    #             print(f"[UNSAT-CORE] ΣP={B_mid} → groups:", flush=True)
-                    #             for base in sorted(by_group.keys()):
-                    #                 rs = sorted(by_group[base])
-                    #                 if rs:
-                    #                     msg = f"  {base}: rounds {rs[0]}..{rs[-1]} (|R|={len(rs)})"
-                    #                 else:
-                    #                     msg = f"  {base}: no round tag"
-                    #                 print(msg, flush=True)
+        if sat_model_star is None:
+            raise NoFeasibleLayoutError(
+                "SAT pool returned no model for the chosen configuration."
+            )
 
-                    #             if culprit_rounds:
-                    #                 print(
-                    #                     f"[UNSAT-CORE] culprit rounds (union): {sorted(culprit_rounds)}",
-                    #                     flush=True,
-                    #                 )
-
-                    #             # Brief per-round context (only first few rounds)
-                    #             for r_bad in sorted(culprit_rounds)[:5]:
-                    #                 if 0 <= r_bad < len(P_arr):
-                    #                     print(
-                    #                         f"[UNSAT-CORE]   r={r_bad}, |P_arr[{r_bad}]| = {len(P_arr[r_bad])}",
-                    #                         flush=True,
-                    #                     )
-                    #                 if 0 <= r_bad < len(BT):
-                    #                     print(
-                    #                         f"[UNSAT-CORE]   r={r_bad}, |BT[{r_bad}]|    = {len(BT[r_bad])}",
-                    #                         flush=True,
-                    #                     )
-
-                    #             culprit_bases = set(by_group.keys())
-                    #             hints = []
-                    #             if "PAIR_REQ" in culprit_bases:
-                    #                 hints.append("PAIR_REQ (check BT vs P_arr)")
-                    #             if "CARD_CELL" in culprit_bases or "CARD_ION" in culprit_bases:
-                    #                 hints.append("CARD_* (global permutation)")
-                    #             if "PHASE_MONO" in culprit_bases:
-                    #                 hints.append("PHASE_MONO (phase monotonicity)")
-                    #             if "H_GATE" in culprit_bases or "V_GATE" in culprit_bases:
-                    #                 hints.append("H_GATE/V_GATE (parity/gating)")
-                    #             if "ROWBLOCK_LINK" in culprit_bases:
-                    #                 hints.append("ROWBLOCK_LINK (row/block linkage vs BT/pairs)")
-                    #             if "CROSS_BOUNDARY" in culprit_bases:
-                    #                 hints.append("CROSS_BOUNDARY (cross-patch boundary bands / prefs)")
-
-                    #             if hints:
-                    #                 print("[UNSAT-CORE] key groups in core:", ", ".join(hints), flush=True)
-
-                    #         else:
-                    #             print(
-                    #                 "[UNSAT-CORE] Unexpected: SAT under assumptions while previous solver said UNSAT.",
-                    #                 flush=True,
-                    #             )
-                    # except Exception as e:
-                    #     print(f"[UNSAT-CORE] core extraction error: {e}", flush=True)
-                    # UNSAT: need more passes in aggregate
-                    B_lo = B_mid + 1
-            
-            if sum_star is not None:
-                break
-        
-
-        if sum_star is None:
-            # try:
-            #     with Minisat22(bootstrap_with=cnf_mid.clauses) as s:
-            #         assumptions = [-lit for lit in grp_sel_mid.values()]
-            #         ok = s.solve(assumptions=assumptions)
-            #         if not ok:
-            #             core = s.get_core() or []
-            #             inv = {lit: name for name, lit in grp_sel_mid.items()}
-
-            #             by_group: Dict[str, Set[int]] = {}
-            #             culprit_rounds: Set[int] = set()
-            #             culprit_fullnames: List[str] = []
-
-            #             for a in core:
-            #                 var = abs(a)
-            #                 fullname = inv.get(var)
-            #                 if fullname is None:
-            #                     continue
-            #                 culprit_fullnames.append(fullname)
-            #                 parts = fullname.split(":")
-            #                 base = parts[0]
-
-            #                 rounds_here: Set[int] = set()
-            #                 for part in parts[1:]:
-            #                     if part.startswith("r"):
-            #                         try:
-            #                             rounds_here.add(int(part[1:]))
-            #                         except ValueError:
-            #                             pass
-
-            #                 if rounds_here:
-            #                     by_group.setdefault(base, set()).update(rounds_here)
-            #                     culprit_rounds.update(rounds_here)
-            #                 else:
-            #                     by_group.setdefault(base, set())
-
-            #             # High-level summary
-            #             print(f"[UNSAT-CORE] ΣP={B_mid} → groups:", flush=True)
-            #             for base in sorted(by_group.keys()):
-            #                 rs = sorted(by_group[base])
-            #                 if rs:
-            #                     msg = f"  {base}: rounds {rs[0]}..{rs[-1]} (|R|={len(rs)})"
-            #                 else:
-            #                     msg = f"  {base}: no round tag"
-            #                 print(msg, flush=True)
-
-            #             if culprit_rounds:
-            #                 print(
-            #                     f"[UNSAT-CORE] culprit rounds (union): {sorted(culprit_rounds)}",
-            #                     flush=True,
-            #                 )
-
-            #             # Brief per-round context (only first few rounds)
-            #             for r_bad in sorted(culprit_rounds)[:5]:
-            #                 if 0 <= r_bad < len(P_arr):
-            #                     print(
-            #                         f"[UNSAT-CORE]   r={r_bad}, |P_arr[{r_bad}]| = {len(P_arr[r_bad])}",
-            #                         flush=True,
-            #                     )
-            #                 if 0 <= r_bad < len(BT):
-            #                     print(
-            #                         f"[UNSAT-CORE]   r={r_bad}, |BT[{r_bad}]|    = {len(BT[r_bad])}",
-            #                         flush=True,
-            #                     )
-
-            #             culprit_bases = set(by_group.keys())
-            #             hints = []
-            #             if "PAIR_REQ" in culprit_bases:
-            #                 hints.append("PAIR_REQ (check BT vs P_arr)")
-            #             if "CARD_CELL" in culprit_bases or "CARD_ION" in culprit_bases:
-            #                 hints.append("CARD_* (global permutation)")
-            #             if "PHASE_MONO" in culprit_bases:
-            #                 hints.append("PHASE_MONO (phase monotonicity)")
-            #             if "H_GATE" in culprit_bases or "V_GATE" in culprit_bases:
-            #                 hints.append("H_GATE/V_GATE (parity/gating)")
-            #             if "ROWBLOCK_LINK" in culprit_bases:
-            #                 hints.append("ROWBLOCK_LINK (row/block linkage vs BT/pairs)")
-            #             if "CROSS_BOUNDARY" in culprit_bases:
-            #                 hints.append("CROSS_BOUNDARY (cross-patch boundary bands / prefs)")
-
-            #             if hints:
-            #                 print("[UNSAT-CORE] key groups in core:", ", ".join(hints), flush=True)
-
-            #         else:
-            #             print(
-            #                 "[UNSAT-CORE] Unexpected: SAT under assumptions while previous solver said UNSAT.",
-            #                 flush=True,
-            #             )
-            # except Exception as e:
-            #     print(f"[UNSAT-CORE] core extraction error: {e}", flush=True)
-            raise NoFeasibleLayoutError("No feasible layout for any Σ_r P_r bound in [0, R * P_max].")
+        rounds_under_sum = max(1, R - optimize_round_start)
+        sum_bound_B = rounds_under_sum * P_max
 
         (
             _,
             vpool_sat,
             ions_sat,
-            var_a_sat,
-            sat_model_star,
-            best_sum_bound,
+            _,
+            _,
+            _,
+        ) = _wise_build_structural_cnf(
+            builder_ctx,
             P_max,
-            chosen_boundary_capacity_factor,
-        ) = chosen_solution
-        if DEBUG_DIAG:
-            print(f"[WISE] minimal ΣP found: {best_sum_bound} (P_max={P_max})", flush=True)
+            sum_bound_B=sum_bound_B,
+            use_wcnf=False,
+            add_boundary_soft=False,
+            phase_label=f"ΣP<={sum_bound_B}/REBUILD",
+            optimize_round_start=optimize_round_start,
+            debug_core=False,
+            core_granularity="coarse",
+            debug_skip_cardinality=False,
+            boundary_adjacent=boundary_adjacent,
+            cross_boundary_prefs=cross_boundary_prefs,
+            boundary_capacity_factor=chosen_boundary_capacity_factor,
+            bt_soft_weight=bt_soft_weight_value,
+        )
 
+        if DEBUG_DIAG:
+            wise_logger.info(
+                "[WISE] chosen config: P_max=%d, cap_factor=%.2f, ΣP=%d",
+                P_max,
+                chosen_boundary_capacity_factor,
+                best_sum_bound,
+            )
+
+        def var_a_sat(r, p, d, c, ion):
+            return vpool_sat.id(("a", r, p, d, c, ion))
+
+        if DEBUG_DIAG:
+            wise_logger.info("[WISE] minimal ΣP found: %d (P_max=%d)", best_sum_bound, P_max)
         pass_horizon = P_max
         P_bounds = ([pass_horizon + n + m] * optimize_round_start + [pass_horizon] * (R - optimize_round_start))
 
@@ -2091,12 +2400,14 @@ class GlobalReconfigurations(Operation):
         ENABLE_MAXSAT = False
         if ENABLE_MAXSAT:
             if DEBUG_DIAG:
-                print(
-                    f"[WISE] building WCNF at ΣP*={best_sum_bound}, P_max={pass_horizon} for MaxSAT...",
-                    flush=True,
+                wise_logger.info(
+                    "[WISE] building WCNF at ΣP*=%d, P_max=%d for MaxSAT...",
+                    best_sum_bound,
+                    pass_horizon,
                 )
             t_build_start = time.time()
-            wcnf, vpool_w, ions_w, var_a_w, _, _ = _build_structural_cnf(
+            wcnf, vpool_w, ions_w, var_a_w, _, _ = _wise_build_structural_cnf(
+                builder_ctx,
                 pass_horizon,
                 sum_bound_B=best_sum_bound,
                 use_wcnf=True,
@@ -2107,14 +2418,17 @@ class GlobalReconfigurations(Operation):
                 boundary_adjacent=boundary_adjacent,
                 cross_boundary_prefs=cross_boundary_prefs,
                 boundary_capacity_factor=chosen_boundary_capacity_factor,
+                bt_soft_weight=bt_soft_weight_value,
             )
             t_build_end = time.time()
 
             if DEBUG_DIAG:
-                print(
-                    f"[WISE] WCNF built: vars={wcnf.nv}, hard={len(wcnf.hard)}, "
-                    f"soft={len(wcnf.soft)}, time={t_build_end - t_build_start:.3f}s",
-                    flush=True,
+                wise_logger.info(
+                    "[WISE] WCNF built: vars=%d, hard=%d, soft=%d, time=%.3fs",
+                    wcnf.nv,
+                    len(wcnf.hard),
+                    len(wcnf.soft),
+                    t_build_end - t_build_start,
                 )
 
             rc2 = RC2(wcnf)
@@ -2123,10 +2437,7 @@ class GlobalReconfigurations(Operation):
             status_rc2 = "ok" if model_rc2 is not None else "error"
 
             if DEBUG_DIAG:
-                print(
-                    f"[WISE] RC2 status={status_rc2}, opt_cost={cost_rc2}",
-                    flush=True,
-                )
+                wise_logger.info("[WISE] RC2 status=%s, opt_cost=%s", status_rc2, cost_rc2)
 
             if status_rc2 == "ok" and model_rc2 is not None:
                 model_used = model_rc2
@@ -2134,17 +2445,15 @@ class GlobalReconfigurations(Operation):
                 var_a_used = var_a_w
                 ions_used = ions_w
                 if DEBUG_DIAG:
-                    print("[WISE] using RC2 MaxSAT model at P*", flush=True)
+                    wise_logger.info("[WISE] using RC2 MaxSAT model at P*")
             else:
                 model_used = sat_model_star
                 vpool_used = vpool_sat
                 var_a_used = var_a_sat
                 ions_used = ions_sat
                 if DEBUG_DIAG:
-                    print(
-                        "[WISE] MaxSAT unavailable (timeout/error); "
-                        "falling back to SAT model at P*.",
-                        flush=True,
+                    wise_logger.info(
+                        "[WISE] MaxSAT unavailable (timeout/error); falling back to SAT model at P*."
                     )
         else:
             model_used = sat_model_star
@@ -2152,7 +2461,7 @@ class GlobalReconfigurations(Operation):
             var_a_used = var_a_sat
             ions_used = ions_sat
             if DEBUG_DIAG:
-                print("[WISE] MaxSAT disabled; using SAT model at P*", flush=True)
+                wise_logger.info("[WISE] MaxSAT disabled; using SAT model at P*")
 
         # Decide which ions are "core" for this slice.
         # A reasonable default: all active ions that lie entirely in the current subgrid.
@@ -2204,13 +2513,14 @@ class GlobalReconfigurations(Operation):
             cur = nxt
 
         # After RC2:
-        schedule = decode_wise_schedule_from_model(
+        schedule = _wise_decode_schedule_from_model(
             model=model_used,
             vpool=vpool_used,
             n=n,
             m=m,
             R=R,
             P_bound=pass_horizon,
+            ignore_initial_reconfig=ignore_initial_reconfig,
         )
 
         row_offset, col_offset = grid_origin
@@ -2226,20 +2536,79 @@ class GlobalReconfigurations(Operation):
                             (r + row_offset, c + col_offset) for (r, c) in pass_info["v_swaps"]
                         ]
         # print(schedule)
-        per_round_z = extract_round_pass_usage(
+        per_round_z = _wise_extract_round_pass_usage(
             model_used,
             vpool_used,
             R,
             pass_horizon,
+            ignore_initial_reconfig,
+            n,
+            m,
         )
         sum_all = sum(per_round_z)
         sum_tail = sum(per_round_z[optimize_round_start:])
 
-        print(
-            f"[WISE] ΣP per round: {per_round_z}, "
-            f"Σ_all={sum_all}, Σ_tail={sum_tail}, "
-            f"best_sum_bound={best_sum_bound}"
+        wise_logger.info(
+            "[WISE] ΣP per round: %s, Σ_all=%d, Σ_tail=%d, best_sum_bound=%d",
+            per_round_z,
+            sum_all,
+            sum_tail,
+            best_sum_bound,
         )
+
+        def _wise_assert_bt_consistency(layouts, BT, R, n, m, logger):
+            """
+            Check BT pin consistency against layouts.
+
+            Logs errors instead of raising and returns True/False.
+            """
+            if BT is None or len(BT) == 0:
+                return True
+
+            ok = True
+
+            if len(layouts) < R:
+                logger.error(
+                    "[WISE] BT consistency check: expected at least %d layouts, got %d",
+                    R, len(layouts),
+                )
+                return False
+
+            for r in range(R):
+                layout_r = np.asarray(layouts[r], dtype=int)
+                if layout_r.shape != (n, m):
+                    logger.error(
+                        "[WISE] BT consistency check: layout[%d] has shape %s, expected (%d, %d)",
+                        r, layout_r.shape, n, m,
+                    )
+                    ok = False
+                    continue
+
+                bt_round = BT[r] if r < len(BT) else {}
+                for ion, (d, c) in bt_round.items():
+                    if not (0 <= d < n and 0 <= c < m):
+                        logger.error(
+                            "[WISE] BT consistency check: BT[%d] pins ion %d to out-of-bounds cell (d=%d, c=%d)",
+                            r, ion, d, c,
+                        )
+                        ok = False
+                        continue
+
+                    found = int(layout_r[d, c])
+                    if found != ion:
+                        logger.error(
+                            "[WISE] BT consistency mismatch at round %d: expected ion %d at (d=%d, c=%d), but found %d",
+                            r, ion, d, c, found,
+                        )
+                        ok = False
+
+            return ok
+        
+        bt_ok = _wise_assert_bt_consistency(layouts, BT, R, n, m, wise_logger)
+        if not bt_ok:
+            wise_logger.warning(
+                "[WISE] BT consistency check failed; proceeding with returned layouts anyway"
+            )
 
         return layouts, schedule, pass_horizon
     
@@ -2255,9 +2624,40 @@ class GlobalReconfigurations(Operation):
         oldAssignment: Sequence[Sequence[int]],
         newAssignment: Sequence[Sequence[int]],
         ignoreSpectators: bool = False,
-        sat_schedule: List[Dict[str, Any]] = None,   # NEW: decoded schedule from RC2
+        sat_schedule: Optional[List[Dict[str, Any]]] = None,   # NEW: decoded schedule from RC2
         initial_placement: bool = False
     ) -> Tuple[Mapping[int, float], float]:
+        # DEBUG: entry into _runOddEvenReconfig
+        # print("[DEBUG _runOddEvenReconfig] called")
+        # try:
+        #     print("  initial_placement =", initial_placement)
+        # except Exception:
+        #     pass
+        # try:
+        #     if hasattr(oldAssignment, "shape"):
+        #         print("  oldAssignment shape =", oldAssignment.shape)
+        #     else:
+        #         print("  oldAssignment len =", len(oldAssignment))
+        # except Exception:
+        #     pass
+        # try:
+        #     if hasattr(newAssignment, "shape"):
+        #         print("  newAssignment shape =", newAssignment.shape)
+        #     else:
+        #         print("  newAssignment len =", len(newAssignment))
+        # except Exception:
+        #     pass
+        # try:
+        #     if sat_schedule is None:
+        #         print("  sat_schedule is None (layout-only reconfig; cached block first step)")
+        #     else:
+        #         print("  sat_schedule type =", type(sat_schedule))
+        #         print("  sat_schedule len =", len(sat_schedule))
+        #         if sat_schedule and isinstance(sat_schedule[0], list):
+        #             print("  sat_schedule[0] passes len =", len(sat_schedule[0]))
+        # except Exception as e:
+        #     print("[DEBUG _runOddEvenReconfig] error inspecting sat_schedule:", repr(e))
+
         # Schedule-aware reconfiguration fallback when SAT results are available.
         heatingRates: Dict[int, float] = {}
         for _, ions in arrangement.items():
@@ -2308,8 +2708,18 @@ class GlobalReconfigurations(Operation):
         # If we have a SAT schedule, use it directly and SKIP Phases B/C/D.
         if sat_schedule is not None:
             acc_passes = 0
+            # print("[DEBUG _runOddEvenReconfig] entering schedule loop, len =", len(sat_schedule))
 
             for pass_idx, info in enumerate(sat_schedule):
+                # try:
+                #     print(
+                #         f"[DEBUG _runOddEvenReconfig] round {pass_idx}: passes type={type(info)}, "
+                #         f"h_swaps={len(info.get('h_swaps', [])) if hasattr(info, 'get') else 'NA'}, "
+                #         f"v_swaps={len(info.get('v_swaps', [])) if hasattr(info, 'get') else 'NA'}"
+                #     )
+                # except Exception as e:
+                #     print("[DEBUG _runOddEvenReconfig] error inspecting schedule entry:", repr(e))
+
                 phase = info.get("phase", "H")
                 h_swaps = info.get("h_swaps", [])
                 v_swaps = info.get("v_swaps", [])
@@ -2362,19 +2772,29 @@ class GlobalReconfigurations(Operation):
 
             # After executing the SAT schedule, check we reached the target.
             if not np.array_equal(A, T):
-                print("[WARN] SAT-driven reconfig: final layout does NOT match newAssignment!")
-                print("  A (final):")
-                print(A)
-                print("  T (target):")
-                print(T)
+                # print("[WARN] SAT-driven reconfig: final layout does NOT match newAssignment!")
+                # print("  A (final):")
+                # print(A)
+                # print("  T (target):")
+                # print(T)
                 # You can raise if you want:
-                # raise RuntimeError("SAT schedule did not realise target layout")
-            if not initial_placement:
-                print(
-                    f"RECONFIGURATION (SAT schedule): {acc_passes} passes were needed for the current reconfiguration round, "
-                    f"taking {timeElapsed} time and {heatingRates} heating"
-                )
+                raise RuntimeError("SAT schedule did not realise target layout")
+            # if not initial_placement:
+            #     print(
+            #         f"RECONFIGURATION (SAT schedule): {acc_passes} passes were needed for the current reconfiguration round, "
+            #         f"taking {timeElapsed} time and {heatingRates} heating"
+            #     )
             return heatingRates, timeElapsed
+        # else:
+            # sat_schedule is None: fall back to heuristic odd-even reconfiguration.
+            # try:
+            #     diff = int(np.sum(A != T))
+            # except Exception:
+            #     diff = "NA"
+            # print(
+            #     "[DEBUG _runOddEvenReconfig] sat_schedule is None; using heuristic odd-even reconfig "
+            #     f"(Phase B/C/D). layout_diffs={diff}"
+            # )
 
         # ======================================================================
         # FALLBACK: original heuristic odd–even reconfiguration (unchanged)
@@ -2384,21 +2804,32 @@ class GlobalReconfigurations(Operation):
         def row_pass_by_rank(even_phase: bool, row_rank: List[Dict[int, int]]) -> bool:
             maxSwapsInRow = 0
             start = 0 if even_phase else 1
+            phase_label = "even" if even_phase else "odd"
+            swaps_this_phase = 0
             for r in range(n):
                 swapsInRow = 0
                 rank = row_rank[r]
                 for c in range(start, m - 1, 2):
                     a = int(A[r, c])
                     b = int(A[r, c + 1])
-                    if not ignoreSpectators and a in spectatorIons and b in spectatorIons:
-                        continue
                     if rank[a] > rank[b]:
-                        A[r, c], A[r, c + 1] = b, a
+                        A[r, c], A[r, c+1] = b, a
+                        # DEBUG / safety: make sure heatingRates has entries
+                        # if a not in heatingRates:
+                        #     print(f"[DEBUG _runOddEvenReconfig][row_pass_by_rank] missing heatingRates entry for ion {a}, initialising to 0.0")
+                        #     heatingRates[a] = 0.0
+                        # if b not in heatingRates:
+                        #     print(f"[DEBUG _runOddEvenReconfig][row_pass_by_rank] missing heatingRates entry for ion {b}, initialising to 0.0")
+                        #     heatingRates[b] = 0.0
                         heatingRates[a] += row_swap_heating
                         heatingRates[b] += row_swap_heating
                         swapsInRow += 1
                 if swapsInRow > maxSwapsInRow:
                     maxSwapsInRow = swapsInRow
+                swaps_this_phase += swapsInRow
+            # print(
+            #     f"[DEBUG _runOddEvenReconfig][row_pass_by_rank] phase={phase_label}, swaps_total={swaps_this_phase}, max_swaps_row={maxSwapsInRow}"
+            # )
             return maxSwapsInRow > 0
 
         def col_bucket_pass(
@@ -2406,13 +2837,13 @@ class GlobalReconfigurations(Operation):
         ) -> bool:
             maxSwapsInCol = 0
             start = 0 if even_phase else 1
+            phase_label = "even" if even_phase else "odd"
+            swaps_this_phase = 0
             for c in range(bucket_mod, m, k):
                 swapsInCol = 0
                 for r in range(start, n - 1, 2):
                     a = int(A[r, c])
                     b = int(A[r + 1, c])
-                    if not ignoreSpectators and a in spectatorIons and b in spectatorIons:
-                        continue
                     if ion_to_dest_row[a] > ion_to_dest_row[b]:
                         A[r, c], A[r + 1, c] = b, a
                         heatingRates[a] += col_swap_heating_rate
@@ -2420,6 +2851,10 @@ class GlobalReconfigurations(Operation):
                         swapsInCol += 1
                 if swapsInCol > maxSwapsInCol:
                     maxSwapsInCol = swapsInCol
+                swaps_this_phase += swapsInCol
+            # print(
+            #     f"[DEBUG _runOddEvenReconfig][col_bucket_pass] bucket_mod={bucket_mod}, phase={phase_label}, swaps_total={swaps_this_phase}, max_swaps_col={maxSwapsInCol}"
+            # )
             return maxSwapsInCol > 0
 
         # ---------- destination row/col maps (ion -> dest row/col) ----------
@@ -2444,11 +2879,31 @@ class GlobalReconfigurations(Operation):
             for c in range(m):
                 dest_rows[r][c] = ion_to_dest_row[desired_row_order[r][c]]
 
-        for c in range(m):
-            assert len(set(dest_rows[r][c] for r in range(n))) == n
+        try:
+            for c in range(m):
+                if len(set(dest_rows[r][c] for r in range(n))) != n:
+                    raise AssertionError("dest_rows column clash")
+        except AssertionError:
+            print(
+                "[DEBUG _runOddEvenReconfig][Phase B] assertion failed: duplicate dest_rows in a column",
+                "m=", m,
+                "n=", n,
+                "dest_rows_col0=", [dest_rows[r][0] for r in range(n)] if m > 0 else [],
+            )
+            raise
 
-        for r in range(n):
-            assert len(set(A[r]).difference(set(desired_row_order[r]))) == 0
+        try:
+            for r in range(n):
+                if len(set(A[r]).difference(set(desired_row_order[r]))) != 0:
+                    raise AssertionError("row permutation mismatch")
+        except AssertionError:
+            print(
+                "[DEBUG _runOddEvenReconfig][Phase B] assertion failed: A row not a permutation of desired_row_order",
+                "row_idx=", r,
+                "A_row=", list(A[r]),
+                "desired_row_order=", list(desired_row_order[r]),
+            )
+            raise
 
         # Row ranks for Phase B permutation
         row_rank_phaseB: List[Dict[int, int]] = []
@@ -2457,6 +2912,9 @@ class GlobalReconfigurations(Operation):
 
         acc_cost = 0
 
+        # print(
+        #     f"[DEBUG _runOddEvenReconfig] Phase B start: m={m}, current_vs_target_diffs={int(np.sum(A != T))}"
+        # )
         # Execute ≤ m odd–even steps to realise the permutation per row
         for _ in range(m):
             oddpass = row_pass_by_rank(True, row_rank_phaseB)
@@ -2468,6 +2926,9 @@ class GlobalReconfigurations(Operation):
         # ==========================================================
         # Phase C: vertical odd–even with k-way parallel buckets.
         # ==========================================================
+        # print(
+        #     f"[DEBUG _runOddEvenReconfig] Phase C start: k={k}, current_vs_target_diffs={int(np.sum(A != T))}"
+        # )
         for t in range(k):
             for _ in range(n):
                 oddpass = col_bucket_pass(True, t, ion_to_dest_row)
@@ -2487,6 +2948,9 @@ class GlobalReconfigurations(Operation):
         row_rank_final: List[Dict[int, int]] = []
         for r in range(n):
             row_rank_final.append({ion: idx for idx, ion in enumerate(T[r, :])})
+        # print(
+        #     f"[DEBUG _runOddEvenReconfig] Phase D start: rows={n}, current_vs_target_diffs={int(np.sum(A != T))}"
+        # )
         for _ in range(m):
             oddpass = row_pass_by_rank(True, row_rank_final)
             evenpass = row_pass_by_rank(False, row_rank_final)
@@ -2494,169 +2958,22 @@ class GlobalReconfigurations(Operation):
             timeElapsed += evenpass * row_swap_time
             acc_cost += int(oddpass) + int(evenpass)
 
-        if not initial_placement:
-            print(
-                f"RECONFIGURATION: {acc_cost} passes were needed for the current reconfiguration round, "
-                f"taking {timeElapsed} time and {heatingRates} heating"
-            )
+        # Final sanity: how close are we to the target layout?
+        try:
+            final_diff = int(np.sum(A != T))
+        except Exception:
+            final_diff = "NA"
+        # print(
+        #     f"[DEBUG _runOddEvenReconfig] Phase D end: acc_cost={acc_cost}, final_layout_diffs={final_diff}"
+        # )
+
+        # if not initial_placement:
+        #     print(
+        #         f"RECONFIGURATION: {acc_cost} passes were needed for the current reconfiguration round, "
+        #         f"taking {timeElapsed} time and {heatingRates} heating"
+        #     )
         return heatingRates, timeElapsed
-    @classmethod
-    def _runOddEvenReconfig2(
-        cls,
-        wiseArch: QCCDWiseArch,
-        arrangement: Mapping[Trap, Sequence[Ion]],
-        oldAssignment: Sequence[Sequence[int]],
-        newAssignment: Sequence[Sequence[int]],
-        ignoreSpectators: bool = False
-    ) -> Tuple[Mapping[int, float], float]:
-        # Basic deterministic reconfiguration without SAT solver; legacy helper.
-        heatingRates: Mapping[int, float]  = {}
-        for _, ions in arrangement.items():
-            for ion in ions:
-                heatingRates[ion.idx] = 0.0
-        timeElapsed = 0.0
-
-        row_swap_time = Move.MOVING_TIME+Merge.MERGING_TIME+CrystalRotation.ROTATION_TIME+Split.SPLITTING_TIME+Move.MOVING_TIME
-        row_swap_heating = Move.MOVING_TIME*Move.HEATING_RATE+Merge.MERGING_TIME*Merge.HEATING_RATE+CrystalRotation.ROTATION_TIME*CrystalRotation.HEATING_RATE+Split.SPLITTING_TIME*Split.HEATING_RATE+Move.MOVING_TIME*Move.HEATING_RATE
-        col_swap_time = (2*JunctionCrossing.CROSSING_TIME)+(4*JunctionCrossing.CROSSING_TIME+Move.MOVING_TIME)*2
-        col_swap_heating_rate = (6*JunctionCrossing.CROSSING_TIME*JunctionCrossing.HEATING_RATE)+Move.MOVING_TIME*Move.HEATING_RATE
-
-        n = wiseArch.n  # rows
-        m = wiseArch.m*wiseArch.k  # cols
-        k = wiseArch.k  # column stride for junction batching
-
-        A = np.array(oldAssignment, dtype=int)      # current
-        T = np.array(newAssignment, dtype=int)      # target
-
-        spectatorIons = []
-        for ions in arrangement.values():
-            spectatorIons.extend([ion for ion in ions if isinstance(ion, SpectatorIon)])
-  
-
-        # ---------- helper: odd-even passes ----------
-        def row_pass_by_rank(even_phase: bool, row_rank: List[Dict[int,int]]) -> bool:
-            maxSwapsInRow=0
-            start = 0 if even_phase else 1
-            for r in range(n):
-                swapsInRow=0
-                rank = row_rank[r]
-                for c in range(start, m-1, 2):
-                    a = int(A[r, c]); b = int(A[r, c+1])
-                    if not ignoreSpectators and a in spectatorIons and b in spectatorIons:
-                        continue
-                    if rank[a] > rank[b]:
-                        A[r, c], A[r, c+1] = b, a
-                        #ROWSWAP {r} {a} {b}
-                        heatingRates[a]+=row_swap_heating
-                        heatingRates[b]+=row_swap_heating
-                        swapsInRow+=1
-                if swapsInRow > maxSwapsInRow:
-                    maxSwapsInRow = swapsInRow
-            return maxSwapsInRow>0
-
-        def col_bucket_pass(even_phase: bool, bucket_mod: int, ion_to_dest_row: Dict[int,int]) -> bool:
-            maxSwapsInCol=0
-            start = 0 if even_phase else 1
-            for c in range(bucket_mod, m, k):
-                swapsInCol=0
-                for r in range(start, n-1, 2):
-                    a = int(A[r, c]); b = int(A[r+1, c])
-                    if not ignoreSpectators and a in spectatorIons and b in spectatorIons:
-                        continue
-                    if ion_to_dest_row[a] > ion_to_dest_row[b]:
-                        A[r, c], A[r+1, c] = b, a
-                        #"COLSWAP {c} {a} {b}"
-                        heatingRates[a]+=col_swap_heating_rate
-                        heatingRates[b]+=col_swap_heating_rate
-                        swapsInCol+=1
-                if swapsInCol > maxSwapsInCol:
-                    maxSwapsInCol = swapsInCol
-            return maxSwapsInCol>0
-
-        # ---------- destination row map (ion -> dest row) ----------
-        ion_to_dest_row: Dict[int,int] = {}
-        ion_to_dest_col: Dict[int, int] = {}
-        for r in range(n):
-            for c in range(m):
-                ion_to_dest_row[int(T[r, c])] = r
-                ion_to_dest_col[int(T[r,c])]=c
-
-        # =========================
-        # Phase A: parallel split
-        # =========================
-        timeElapsed += Split.SPLITTING_TIME
-        for idx in heatingRates.keys():
-            heatingRates[idx]+=Split.HEATING_RATE*Split.SPLITTING_TIME
-
-        # ==========================================================
-        # Phase B: ensure each column has unique destination rows
-        # via m perfect matchings (edge-coloring); then 1D odd-even
-        # per row to realize the assigned per-row permutation.
-        # ==================
-
-        desired_row_order = np.zeros_like(A)
-        for r in range(n):
-            for ionidx in A[r]:
-                desired_row_order[r][ion_to_dest_col[ionidx]]=ionidx
-
-        dest_rows = [[None]*m for _ in range(n)]
-        for r in range(n):
-            for c in range(m):
-                dest_rows[r][c] = ion_to_dest_row[desired_row_order[r][c]]
-
-        for c in range(m):
-            assert (len(set(dest_rows[r][c] for r in range(n)))==n)
-
-        for r in range(n):
-            assert len(set(A[r]).difference(set(desired_row_order[r])))==0
-        # Row ranks for Phase B permutation
-        row_rank_phaseB: List[Dict[int,int]] = []
-        for r in range(n):
-            row_rank_phaseB.append({ion: idx for idx, ion in enumerate(desired_row_order[r])})
-
-        # Execute ≤ m odd–even steps to realize the permutation per row
-        acc_cost = 0
-        for _ in range(m):
-            oddpass = row_pass_by_rank(True,  row_rank_phaseB)
-            evenpass = row_pass_by_rank(False, row_rank_phaseB)
-            timeElapsed+=oddpass*row_swap_time
-            timeElapsed+=evenpass*row_swap_time
-            acc_cost+=int(oddpass)+ int(evenpass)
-
-        # diff = est_cost-acc_cost
-
-        # ==========================================================
-        # Phase C: vertical odd–even with k-way parallel buckets,
-        # comparator = destination row (time-optimal ≤ n).
-        # ==========================================================
-        for t in range(k):
-            for _ in range(n):
-                oddpass=col_bucket_pass(True,  t, ion_to_dest_row)
-                evenpass=col_bucket_pass(False, t, ion_to_dest_row)
-                timeElapsed+=oddpass*col_swap_time
-                timeElapsed+=evenpass*col_swap_time
-                acc_cost+=int(oddpass)+ int(evenpass)
-            if t < k - 1:
-                #"Parrellel row reconfig"
-                timeElapsed += k*row_swap_time
-                for idx in heatingRates.keys():
-                    heatingRates[idx]+=row_swap_heating
-
-        # ==========================================================
-        # Phase D: final row-wise odd–even to exact target order.
-        # ==========================================================
-        row_rank_final: List[Dict[int,int]] = []
-        for r in range(n):
-            row_rank_final.append({ion: idx for idx, ion in enumerate(T[r, :])})
-        for _ in range(m):
-            oddpass = row_pass_by_rank(True,  row_rank_final)
-            evenpass = row_pass_by_rank(False, row_rank_final)
-            timeElapsed+=oddpass*row_swap_time
-            timeElapsed+=evenpass*row_swap_time
-            acc_cost+=int(oddpass)+ int(evenpass)
-
-        print(f"RECONFIGURATION: {acc_cost} passes were needed for the current reconfiguration round, taking {timeElapsed} time and {heatingRates} heating")
-        return heatingRates, timeElapsed
+   
     
 
 

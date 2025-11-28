@@ -19,10 +19,10 @@ from src.compiler.qccd_parallelisation import *
 from src.compiler.qccd_qubits_to_ions import *
 from src.compiler.qccd_ion_routing import *
 from src.compiler.qccd_WISE_ion_route import *
-from src.Moveless_QCCDSimWork.machine import Machine, machine_graph_to_labeled_coordinates
-from src.Moveless_QCCDSimWork.parse import InputParse
-from src.Moveless_QCCDSimWork.mappers import QubitMapGreedy
-from src.Moveless_QCCDSimWork import customScheduler
+# from src.Moveless_QCCDSimWork.machine import Machine, machine_graph_to_labeled_coordinates
+# from src.Moveless_QCCDSimWork.parse import InputParse
+# from src.Moveless_QCCDSimWork.mappers import QubitMapGreedy
+# from src.Moveless_QCCDSimWork import customScheduler
 from src.Moveless_QCCDSimWork.analyzer import *
 import logging
 from multiprocessing import get_logger
@@ -56,11 +56,12 @@ class QCCDCircuit(stim.Circuit):
     def generated(cls, *args, **kwargs) -> "QCCDCircuit":
         return QCCDCircuit(stim.Circuit.generated(*args, **kwargs).__str__())
 
-    def circuitString(self, include_annotation: bool = False) -> Sequence[str]:
+    def circuitString(self, include_annotation: bool = False) -> Tuple[Sequence[str], Sequence[Sequence[Tuple[int, int]]]]:
         instructions = (
             self.flattened().decomposed().without_noise().__str__().splitlines()
         )
         newInstructions = []
+        toMoves = []
         for i in instructions:
             qubits = i.rsplit(" ")[1:]
             if i.startswith("DETECTOR") or i.startswith("TICK") or i.startswith("OBSERVABLE"):
@@ -72,19 +73,29 @@ class QCCDCircuit(stim.Circuit):
                     newInstructions.append(f"{i[0]} {qubit}")
                 # newInstructions.append("BARRIER")
             elif any(i.startswith(s) for s in stim.gate_data("cnot").aliases):
+                toMove = []
                 for i in range(int(len(qubits) / 2)):
                     newInstructions.append(f"CNOT {qubits[2*i]} {qubits[2*i+1]}")
+                    toMove.append((qubits[2*i], qubits[2*i+1]))
+                toMoves.append(toMove)
+                newInstructions.append("BARRIER")
+            elif any(i.startswith(s) for s in stim.gate_data("cz").aliases):
+                toMove = []
+                for i in range(int(len(qubits) / 2)):
+                    newInstructions.append(f"CZ {qubits[2*i]} {qubits[2*i+1]}")
+                    toMove.append((qubits[2*i], qubits[2*i+1]))
+                toMoves.append(toMove)
                 newInstructions.append("BARRIER")
             else:
                 newInstructions.append(i)
-        return newInstructions
+        return newInstructions, toMoves
 
     @property
     def ionMapping(self) -> Mapping[int, Tuple[Ion, Tuple[int, int]]]:
         return self._ionMapping
 
-    def _parseCircuitString(self, dataQubitsIdxs: Optional[Sequence[int]]=None) -> Tuple[Sequence[QubitOperation], Sequence[int]]:
-        instructions = self.circuitString()
+    def _parseCircuitString(self, dataQubitsIdxs: Optional[Sequence[int]]=None) -> Tuple[Sequence[QubitOperation], Sequence[int], Sequence[Sequence[TwoQubitMSGate]]]:
+        instructions, toMoves = self.circuitString()
 
         self._measurementIons = []
         self._ionMapping = {}
@@ -97,15 +108,24 @@ class QCCDCircuit(stim.Circuit):
                 map(int, i.removeprefix("QUBIT_COORDS(").split(")")[0].split(","))
             )
             idx = int(i.split(" ")[-1])
-            ion = QubitIon(self.MEASUREMENT_QUBIT_COLOR, label="M")
-            ion.set(ion.idx, *coords)
-            self._ionMapping[idx] = ion, coords
-            self._measurementIons.append(ion)
+            if dataQubitsIdxs is not None or (coords[0]%2)==0:
+                ion = QubitIon(self.MEASUREMENT_QUBIT_COLOR, label="M")
+                ion.set(ion.idx, *coords)
+                self._ionMapping[idx] = ion, coords
+                self._measurementIons.append(ion)
+            else:
+                ion = QubitIon(self.DATA_QUBIT_COLOR, label="D")
+                ion.set(ion.idx, *coords)
+                self._ionMapping[idx] = ion, coords
+                self._dataIons.append(ion)
+
 
         instructions = instructions[j:]
         operations = []
         barriers = []
         dataQubits = []
+        toMoveOps = [[] for _ in range(len(toMoves))]
+        toMoveIdx = 0
         # TODO establish correct mapping of qubit operations from QIP toolkit with references
         for j, i in enumerate(instructions):
             if i.startswith("BARRIER"):
@@ -117,16 +137,18 @@ class QCCDCircuit(stim.Circuit):
             ion = self._ionMapping[idx][0]
             if i[0] == "M":
                 operations.append(Measurement.qubitOperation(ion))
-                if dataQubitsIdxs is None:
-                    dataQubits.append(ion) # data qubits are the ones measured at the end
+                # if dataQubitsIdxs is None:
+                #     # dataQubits.append(ion) # data qubits are the ones measured at the end
+                #     dataQubits.clear()
             elif i[0] == "H":
                 # page 80 https://iontrap.umd.edu/wp-content/uploads/2013/10/FiggattThesis.pdf
                 operations.extend([
                     YRotation.qubitOperation(ion),
                     XRotation.qubitOperation(ion)
                 ])
-                if dataQubitsIdxs is None:
-                    dataQubits.clear()
+                # if dataQubitsIdxs is None:
+                #     # dataQubits.clear()
+                #     dataQubits.append(ion) # data qubits are the ones with hadamard at the end
             elif i[0] == "R":
                 operations.append(QubitReset.qubitOperation(ion))
                 if dataQubitsIdxs is None:
@@ -144,8 +166,33 @@ class QCCDCircuit(stim.Circuit):
                     ),
                     YRotation.qubitOperation(ion)
                 ])
-                if dataQubitsIdxs is None:
-                    dataQubits.clear()
+                # if dataQubitsIdxs is None:
+                #     dataQubits.clear()
+                toMoveOps[toMoveIdx].append(operations[-2])
+                if len(toMoveOps[toMoveIdx])==len(toMoves[toMoveIdx]):
+                    toMoveIdx+=1
+            elif i.startswith("CZ"):
+                idx2 = int(i.split(" ")[2])
+                ion2 = self._ionMapping[idx2][0]
+                # Fig 4. https://journals.aps.org/pra/pdf/10.1103/PhysRevA.99.022330
+                # Adding I H = I (RY RX) before and after CNOT then cancelling (IH CNOT IH)
+                operations.extend([
+                    YRotation.qubitOperation(ion),
+                    XRotation.qubitOperation(ion),
+                    YRotation.qubitOperation(ion2),
+                    XRotation.qubitOperation(ion2),
+                    TwoQubitMSGate.qubitOperation(
+                        ion, ion2
+                    ),
+                    YRotation.qubitOperation(ion),
+                    YRotation.qubitOperation(ion2),
+                    XRotation.qubitOperation(ion2),
+                ])
+                # if dataQubitsIdxs is None:
+                #     dataQubits.clear()
+                toMoveOps[toMoveIdx].append(operations[-4])
+                if len(toMoveOps[toMoveIdx])==len(toMoves[toMoveIdx]):
+                    toMoveIdx+=1
         if dataQubitsIdxs is not None:
             dataQubits = [self._ionMapping[j][0] for j in dataQubitsIdxs]
         # TODO use cooling ions? probs not here since architecture dependent
@@ -154,7 +201,7 @@ class QCCDCircuit(stim.Circuit):
             d._label = "D"
             self._dataIons.append(d)
             self._measurementIons.remove(d)
-        return operations, barriers
+        return operations, barriers, toMoveOps
 
     def _gridToCoordinate(
         self, pos: Tuple[int, int], trapCapacity: int
@@ -182,7 +229,7 @@ class QCCDCircuit(stim.Circuit):
         # TODO add the effect of dephasing noise from idling qubits involved in splits and merges into this simulation (see notability notes)
         # TODO add importance subset sampling (see notability notes)
         # TODO speed up with sinter (see stim/getting_started)
-        stimInstructions = self.circuitString(include_annotation=True)
+        stimInstructions, _ = self.circuitString(include_annotation=True)
         
         stimIdxs: List[int] = []
         ions: List[Ion] = []
@@ -223,7 +270,7 @@ class QCCDCircuit(stim.Circuit):
         for i in stimInstructions:
             if i.startswith("BARRIER"):
                 continue
-            idx = int(i.split(" ")[1]) if ( i[0] in ("M", "H", "R") or i.startswith("CNOT")) else -1
+            idx = int(i.split(" ")[1]) if ( i[0] in ("M", "H", "R") or i.startswith("CNOT") or i.startswith("CZ")) else -1
             doNoiseAfter = False if i[0]=="M" else True
             if i[0] == "M" or i[0] == "R":
                 ops = operationsForIons[idx][:1]
@@ -235,10 +282,22 @@ class QCCDCircuit(stim.Circuit):
             elif i.startswith("CNOT"):
                 idx2 = int(i.split(" ")[2])
                 # Do not duplicate the two qubit gate
-                ops = operationsForIons[idx][:3] + operationsForIons[idx2][:1]
+                ops = operationsForIons[idx][:4] + operationsForIons[idx2][:1]
                 operationsForIons[idx].pop(0)
                 operationsForIons[idx].pop(0)
                 operationsForIons[idx].pop(0)
+                operationsForIons[idx2].pop(0)
+                operationsForIons[idx2].pop(0)
+            elif i.startswith("CZ"):
+                idx2 = int(i.split(" ")[2])
+                # Do not duplicate the two qubit gate
+                ops = operationsForIons[idx][:4] + operationsForIons[idx2][:2]+operationsForIons[idx2][3:5]
+                operationsForIons[idx].pop(0)
+                operationsForIons[idx].pop(0)
+                operationsForIons[idx].pop(0)
+                operationsForIons[idx2].pop(0)
+                operationsForIons[idx2].pop(0)
+                operationsForIons[idx2].pop(0)
                 operationsForIons[idx2].pop(0)
                 operationsForIons[idx2].pop(0)
             else:
@@ -320,71 +379,71 @@ class QCCDCircuit(stim.Circuit):
 
 
 
-    def processCircuitWithQCCDSimMachine(
-            self,
-            machine: Machine,
-            dataQubitIdxs: Optional[Sequence[int]]=None,
-    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]: 
-        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
-        if machine.num_ions < len(self._ionMapping):
-            raise ValueError("processCircuit: not enough traps")
+    # def processCircuitWithQCCDSimMachine(
+    #         self,
+    #         machine: Machine,
+    #         dataQubitIdxs: Optional[Sequence[int]]=None,
+    # ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]: 
+    #     instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+    #     if machine.num_ions < len(self._ionMapping):
+    #         raise ValueError("processCircuit: not enough traps")
         
-        qasmCircuit = self.without_noise().to_qasm(open_qasm_version=OPEN_QASM_VERSION, skip_dets_and_obs=True)
-        trapCapacity = 0
-        #Parse the input program DAG
-        ip = InputParse()
-        ip.parse_from_string(qasmCircuit)
+    #     qasmCircuit = self.without_noise().to_qasm(open_qasm_version=OPEN_QASM_VERSION, skip_dets_and_obs=True)
+    #     trapCapacity = 0
+    #     #Parse the input program DAG
+    #     ip = InputParse()
+    #     ip.parse_from_string(qasmCircuit)
 
-        # qm = QubitMapGreedy(ip, machine)
-        # mapping = qm.compute_mapping()  
+    #     # qm = QubitMapGreedy(ip, machine)
+    #     # mapping = qm.compute_mapping()  
         
-        mapping = customScheduler.get_custom_mapping(qasmCircuit, machine, "", len(self._measurementIons), len(self._ionMapping))
+    #     mapping = customScheduler.get_custom_mapping(qasmCircuit, machine, "", len(self._measurementIons), len(self._ionMapping))
 
-        labelled_coords = machine_graph_to_labeled_coordinates(machine)
+    #     labelled_coords = machine_graph_to_labeled_coordinates(machine)
 
-        self._arch = QCCDArch()
+    #     self._arch = QCCDArch()
         
-        coordsToNd = {}
-        nToNd = {}
-        for (l, n, cx, cy) in labelled_coords:
-            if l=='T':
-                trapCapacity = n.capacity
-                nd = self._arch.addManipulationTrap(
-                    *self._gridToCoordinate((cx, cy), trapCapacity), [self._ionMapping[idx][0] for idx in mapping[n.id]], isHorizontal=False, capacity=n.capacity,  color=self.TRAP_COLOR,
-                )
-            else:
-                nd = self._arch.addJunction(
-                    *self._gridToCoordinate((cx, cy), trapCapacity)
-                )
-            coordsToNd[(cx, cy)] = nd, l
-            nToNd[n] = nd
-        # minX, maxX = min(lc[2] for lc in labelled_coords), max(lc[2] for lc in labelled_coords)
-        # minY, maxY = min(lc[3] for lc in labelled_coords), max(lc[3] for lc in labelled_coords)
-        # for x in range(minX, maxX+1, 1):
-        #     for y in range(minY, maxY+1, 1):
-        #         if (x,y) in coordsToNd:
-        #             nd1, l1 = coordsToNd[(x,y)]
-        #             if (x+1, y) in coordsToNd:
-        #                 nd2, l2 = coordsToNd[(x+1,y)]
-        #                 if l1 == 'J' or l2 == 'J':   
-        #                     self._arch.addEdge(nd1, nd2)
-        #             if (x, y+1) in coordsToNd:
-        #                 nd2, l2 = coordsToNd[(x, y+1)]
-        #                 if l1 == 'J' or l2 == 'J':   
-        #                     self._arch.addEdge(nd1, nd2)
+    #     coordsToNd = {}
+    #     nToNd = {}
+    #     for (l, n, cx, cy) in labelled_coords:
+    #         if l=='T':
+    #             trapCapacity = n.capacity
+    #             nd = self._arch.addManipulationTrap(
+    #                 *self._gridToCoordinate((cx, cy), trapCapacity), [self._ionMapping[idx][0] for idx in mapping[n.id]], isHorizontal=False, capacity=n.capacity,  color=self.TRAP_COLOR,
+    #             )
+    #         else:
+    #             nd = self._arch.addJunction(
+    #                 *self._gridToCoordinate((cx, cy), trapCapacity)
+    #             )
+    #         coordsToNd[(cx, cy)] = nd, l
+    #         nToNd[n] = nd
+    #     # minX, maxX = min(lc[2] for lc in labelled_coords), max(lc[2] for lc in labelled_coords)
+    #     # minY, maxY = min(lc[3] for lc in labelled_coords), max(lc[3] for lc in labelled_coords)
+    #     # for x in range(minX, maxX+1, 1):
+    #     #     for y in range(minY, maxY+1, 1):
+    #     #         if (x,y) in coordsToNd:
+    #     #             nd1, l1 = coordsToNd[(x,y)]
+    #     #             if (x+1, y) in coordsToNd:
+    #     #                 nd2, l2 = coordsToNd[(x+1,y)]
+    #     #                 if l1 == 'J' or l2 == 'J':   
+    #     #                     self._arch.addEdge(nd1, nd2)
+    #     #             if (x, y+1) in coordsToNd:
+    #     #                 nd2, l2 = coordsToNd[(x, y+1)]
+    #     #                 if l1 == 'J' or l2 == 'J':   
+    #     #                     self._arch.addEdge(nd1, nd2)
 
-        for edge in machine.graph.edges:
-            n1, n2 = edge[0], edge[1]
-            self._arch.addEdge(nToNd[n1], nToNd[n2])
+    #     for edge in machine.graph.edges:
+    #         n1, n2 = edge[0], edge[1]
+    #         self._arch.addEdge(nToNd[n1], nToNd[n2])
 
         
 
-        trap_ions = {}
-        for i in machine.traps:
-            if mapping[i.id]:
-                trap_ions[i.id] = mapping[i.id][:]
+    #     trap_ions = {}
+    #     for i in machine.traps:
+    #         if mapping[i.id]:
+    #             trap_ions[i.id] = mapping[i.id][:]
 
-        return self._arch, (instructions, barriers)
+    #     return self._arch, (instructions, barriers)
 
 
     def processCircuitAugmentedGrid(
@@ -395,7 +454,7 @@ class QCCDCircuit(stim.Circuit):
         padding: int = 1,
         dataQubitIdxs: Optional[Sequence[int]]=None,
     ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
-        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+        instructions, barriers, _ = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
         if (trapCapacity-1) * ((rows-1) * (2*cols-1)+cols) < len(self._ionMapping):
             raise ValueError("processCircuit: not enough traps")
            
@@ -506,8 +565,8 @@ class QCCDCircuit(stim.Circuit):
         dataQubitIdxs: Optional[Sequence[int]]=None,
         addSpectators: bool = True,
         compactClustering: bool = True
-    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
-        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+    ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int], Sequence[Sequence[TwoQubitMSGate]]]]:        
+        instructions, barriers, toMoveOps = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
         if compactClustering and wiseArch.m*wiseArch.n*wiseArch.k < len(self._ionMapping):
             raise ValueError("processCircuit: not enough traps")
         # if not compactClustering and (wiseArch.k-1) * ((rows-1) * (cols-1)+cols) < len(self._ionMapping):
@@ -607,7 +666,7 @@ class QCCDCircuit(stim.Circuit):
 
         if any(i.parent is None for i in self._arch.ions.values()):
             raise ValueError(f"Ions not in traps for {wiseArch.k} and {len(self._measurementIons)+len(self._dataIons)}")
-        return self._arch, (instructions, barriers)
+        return self._arch, (instructions, barriers, toMoveOps)
     
 
     def processCircuitNetworkedGrid(self,
@@ -616,7 +675,7 @@ class QCCDCircuit(stim.Circuit):
         dataQubitIdxs: Optional[Sequence[int]]=None
         # capacityIsInTermsOfDataIons: bool = False
     ) -> Tuple[QCCDArch, Tuple[Sequence[QubitOperation], Sequence[int]]]:        
-        instructions, barriers = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
+        instructions, barriers, _ = self._parseCircuitString(dataQubitsIdxs=dataQubitIdxs)
         if (trapCapacity-1) * traps< len(self._ionMapping):
             raise ValueError("processCircuit: not enough traps")
            
@@ -723,7 +782,7 @@ def process_circuit(distance, capacity, gate_improvements, num_shots):
     physicalXErrors = []
     
     for gate_improvement in gate_improvements:
-        logicalError, physicalXError, physicalZError = circuit.simulate(allOps, num_shots=num_shots, error_scaling=gate_improvement)
+        logicalError, physicalXError, physicalZError = circuit.simulate(allOps, num_shots=num_shots, error_scaling=gate_improvement, isWISEArch=False)
         logicalErrors.append(logicalError)
         physicalZErrors.append(physicalZError)
         physicalXErrors.append(physicalXError)
@@ -822,7 +881,7 @@ def process_circuit_wise_arch(distance, capacity, gate_improvements, num_shots):
     physicalXErrors = []
     
     for gate_improvement in gate_improvements:
-        logicalError, physicalXError, physicalZError = circuit.simulate(allOps, num_shots=num_shots, error_scaling=gate_improvement)
+        logicalError, physicalXError, physicalZError = circuit.simulate(allOps, num_shots=num_shots, error_scaling=gate_improvement, isWISEArch=True)
         logicalErrors.append(logicalError)
         physicalZErrors.append(physicalZError)
         physicalXErrors.append(physicalXError)
